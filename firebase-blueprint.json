@@ -1,0 +1,46 @@
+{
+  "entities": {
+    "Interview": {
+      "title": "Interview",
+      "description": "An interview session for an applicant",
+      "type": "object",
+      "properties": {
+        "applicantName": {
+          "type": "string",
+          "description": "Name of the applicant"
+        },
+        "jobTitle": {
+          "type": "string",
+          "description": "Job title"
+        },
+        "jobDescription": {
+          "type": "string",
+          "description": "Job description"
+        },
+        "interviewType": {
+          "type": "string",
+          "description": "Type of interview"
+        },
+        "duration": {
+          "type": "integer",
+          "description": "Duration in minutes"
+        },
+        "status": {
+          "type": "string",
+          "description": "Status of the interview"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Creation timestamp"
+        }
+      },
+      "required": ["applicantName", "jobTitle", "status", "createdAt"]
+    }
+  },
+  "firestore": {
+    "interviews": {
+      "schema": "Interview",
+      "description": "Collection of interviews"
+    }
+  }
+}

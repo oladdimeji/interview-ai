@@ -1,0 +1,11 @@
+{
+  "name": "InterviewAI",
+  "description": "A full-stack AI interview platform with real-time audio and video, automated transcription, and comprehensive candidate reports.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
