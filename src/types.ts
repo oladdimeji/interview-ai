@@ -23,6 +23,7 @@ export interface Interview {
   transcript: TranscriptEntry[];
   recordingUrl?: string;
   recordingStatus?: 'uploading' | 'ready' | 'failed' | 'local_only';
+  assessmentStatus?: 'ready' | 'failed';
   summary?: string;
   scoreBreakdown?: ScoreCriterion[];
   decision?: 'hire' | 'no_hire';

@@ -1,5 +1,45 @@
 {
   "entities": {
+    "TranscriptEntry": {
+      "title": "TranscriptEntry",
+      "description": "A single spoken turn in the interview transcript",
+      "type": "object",
+      "properties": {
+        "sender": {
+          "type": "string",
+          "description": "Either 'AI' or 'Candidate'"
+        },
+        "text": {
+          "type": "string",
+          "description": "The transcribed speech text"
+        },
+        "timestamp": {
+          "type": "integer",
+          "description": "Epoch timestamp in milliseconds"
+        }
+      },
+      "required": ["sender", "text", "timestamp"]
+    },
+    "ScoreCriterion": {
+      "title": "ScoreCriterion",
+      "description": "Evaluation of a single competency or criteria",
+      "type": "object",
+      "properties": {
+        "criteria": {
+          "type": "string",
+          "description": "The evaluated metric name"
+        },
+        "score": {
+          "type": "integer",
+          "description": "Score from 1 to 10"
+        },
+        "feedback": {
+          "type": "string",
+          "description": "Critique and supporting context"
+        }
+      },
+      "required": ["criteria", "score", "feedback"]
+    },
     "Interview": {
       "title": "Interview",
       "description": "An interview session for an applicant",
@@ -19,7 +59,7 @@
         },
         "interviewType": {
           "type": "string",
-          "description": "Type of interview"
+          "description": "Type of interview (Technical, Behavioral, Screening)"
         },
         "duration": {
           "type": "integer",
@@ -31,10 +71,60 @@
         },
         "createdAt": {
           "type": "string",
-          "description": "Creation timestamp"
+          "description": "Creation timestamp ISO string"
+        },
+        "startedAt": {
+          "type": "integer",
+          "description": "Epoch timestamp when the interview began"
+        },
+        "transcript": {
+          "type": "array",
+          "items": {
+            "$ref": "#/entities/TranscriptEntry"
+          },
+          "description": "Chronological speech turns"
+        },
+        "recordingUrl": {
+          "type": "string",
+          "description": "URL of the session recording"
+        },
+        "recordingStatus": {
+          "type": "string",
+          "description": "Status of video upload (uploading, ready, failed, local_only)"
+        },
+        "assessmentStatus": {
+          "type": "string",
+          "description": "Status of automated AI evaluation (ready, failed)"
+        },
+        "summary": {
+          "type": "string",
+          "description": "AI-generated executive summary"
+        },
+        "scoreBreakdown": {
+          "type": "array",
+          "items": {
+            "$ref": "#/entities/ScoreCriterion"
+          },
+          "description": "Skill assessment criteria and grades"
+        },
+        "decision": {
+          "type": "string",
+          "description": "Hiring decision (hire, no_hire)"
+        },
+        "decisionReasoning": {
+          "type": "string",
+          "description": "Detailed justification of the hiring decision"
+        },
+        "cvText": {
+          "type": "string",
+          "description": "Raw extracted text of the CV/resume"
+        },
+        "cvFileUrl": {
+          "type": "string",
+          "description": "URL to view or download the uploaded CV/resume"
         }
       },
-      "required": ["applicantName", "jobTitle", "status", "createdAt"]
+      "required": ["applicantName", "jobTitle", "jobDescription", "interviewType", "duration", "status", "createdAt", "transcript"]
     }
   },
   "firestore": {

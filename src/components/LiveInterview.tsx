@@ -350,27 +350,78 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
             let currentQueueIndex = 0;
             let activeUploadsCount = 0;
 
+            const isTransientClientError = (status: number, errText: string): boolean => {
+              if (status === 503 || status === 502 || status === 504 || status === 429 || status === 408) {
+                return true;
+              }
+              const lower = errText.toLowerCase();
+              if (lower.includes("transient") || lower.includes("rate limit") || lower.includes("timeout") || lower.includes("rate_limit") || lower.includes("503") || lower.includes("502") || lower.includes("504")) {
+                return true;
+              }
+              return false;
+            };
+
             const uploadTask = async (chunkIndex: number): Promise<{ url?: string; fallbackUsed?: boolean } | null> => {
               const start = chunkIndex * CHUNK_SIZE;
               const end = Math.min(start + CHUNK_SIZE, videoBlob.size);
               const chunkBlob = videoBlob.slice(start, end);
 
-              console.log(`[Background Process] [Parallel] Uploading chunk ${chunkIndex + 1}/${totalChunks} (${chunkBlob.size} bytes) for interview ${interviewId}...`);
+              const maxChunkRetries = 3;
+              let attempt = 0;
 
-              const response = await fetch(`/api/upload-video-chunk?interviewId=${interviewId}&chunkIndex=${chunkIndex}&totalChunks=${totalChunks}`, {
-                method: "POST",
-                headers: { "Content-Type": "application/octet-stream" },
-                body: chunkBlob
-              });
+              while (true) {
+                try {
+                  console.log(`[Background Process] [Parallel] Uploading chunk ${chunkIndex + 1}/${totalChunks} (${chunkBlob.size} bytes) for interview ${interviewId} (Attempt ${attempt + 1}/${maxChunkRetries + 1})...`);
 
-              if (!response.ok) {
-                const errText = await response.text();
-                throw new Error(`Server returned error status ${response.status} for chunk ${chunkIndex}: ${errText}`);
+                  const response = await fetch(`/api/upload-video-chunk?interviewId=${interviewId}&chunkIndex=${chunkIndex}&totalChunks=${totalChunks}`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/octet-stream" },
+                    body: chunkBlob
+                  });
+
+                  if (!response.ok) {
+                    const errText = await response.text();
+                    const status = response.status;
+                    const isTransient = isTransientClientError(status, errText);
+
+                    console.warn(`[Background Process] Chunk ${chunkIndex + 1} upload failed with status ${status}. Is transient: ${isTransient}. Details: ${errText}`);
+
+                    if (isTransient && attempt < maxChunkRetries) {
+                      attempt++;
+                      const backoffMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s
+                      console.log(`[Background Process] Retrying chunk ${chunkIndex + 1} upload in ${backoffMs}ms (Attempt ${attempt}/${maxChunkRetries})...`);
+                      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+                      continue;
+                    } else {
+                      console.error(`[Background Process] Chunk ${chunkIndex + 1} upload permanently failed after retries or non-transient error.`);
+                      throw new Error(`Server returned non-transient error status ${status} for chunk ${chunkIndex}: ${errText}`);
+                    }
+                  }
+
+                  const result = await response.json();
+                  if (attempt > 0) {
+                    console.log(`[Background Process] [Parallel] Chunk ${chunkIndex + 1}/${totalChunks} succeeded on retry attempt ${attempt}!`);
+                  } else {
+                    console.log(`[Background Process] [Parallel] Chunk ${chunkIndex + 1}/${totalChunks} uploaded successfully on first attempt.`);
+                  }
+                  return result;
+
+                } catch (err: any) {
+                  const isNetworkError = err instanceof TypeError || (err.message && err.message.toLowerCase().includes("fetch"));
+                  console.error(`[Background Process] Exception during chunk ${chunkIndex + 1} upload (Network error? ${isNetworkError}):`, err);
+
+                  if (isNetworkError && attempt < maxChunkRetries) {
+                    attempt++;
+                    const backoffMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s
+                    console.log(`[Background Process] Retrying chunk ${chunkIndex + 1} upload in ${backoffMs}ms due to network error (Attempt ${attempt}/${maxChunkRetries})...`);
+                    await new Promise((resolve) => setTimeout(resolve, backoffMs));
+                    continue;
+                  } else {
+                    console.error(`[Background Process] Chunk ${chunkIndex + 1} upload permanently failed (retries exhausted or non-transient error).`);
+                    throw err;
+                  }
+                }
               }
-
-              const result = await response.json();
-              console.log(`[Background Process] [Parallel] Chunk ${chunkIndex + 1}/${totalChunks} uploaded successfully.`, result);
-              return result;
             };
 
             const uploadPool = () => {
@@ -457,34 +508,57 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
         console.warn(`[Background Process] Video upload skipped for interview ${interviewId} because hasRecording is false.`);
       }
 
-      // Task B: Trigger Backend assessment generation (Independent)
+      // Task B: Trigger Backend assessment generation with Firestore propagation delay and exponential backoff retries
       (async () => {
-        try {
-          console.log("[Background Process] Triggering backend AI assessment...");
-          const response = await fetch('/api/assess', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ interviewId })
-          });
+        // Step 1: Wait 1500ms to guarantee Firestore client writes are fully synced and propagated to the backend
+        console.log("[Background Process] Waiting 1500ms for Firestore write propagation before triggering assessment...");
+        await new Promise((resolve) => setTimeout(resolve, 1500));
 
-          if (!response.ok) {
-            console.error("[Background Process] Assessment API returned non-ok status:", response.status);
-          } else {
-            console.log("[Background Process] Backend AI assessment trigger completed successfully!");
-          }
-        } catch (assessErr) {
-          console.error("[Background Process] Assessment trigger failed:", assessErr);
-          // In case of error, still try to set status to 'completed' as fallback so the admin can see it
+        const maxRetries = 3;
+        let attempt = 0;
+        let success = false;
+        let lastError: any = null;
+
+        while (attempt <= maxRetries && !success) {
           try {
-            const docSnap = await getDoc(doc(db, 'interviews', interviewId));
-            const data = docSnap.exists() ? docSnap.data() as Interview : null;
-            if (data && data.status !== 'completed') {
-              await updateDoc(doc(db, 'interviews', interviewId), {
-                status: 'completed'
-              });
+            if (attempt > 0) {
+              const backoffMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s
+              console.log(`[Background Process] Retrying assessment in ${backoffMs}ms (Attempt ${attempt}/${maxRetries})...`);
+              await new Promise((resolve) => setTimeout(resolve, backoffMs));
             }
-          } catch (e) {
-            console.error("[Background Process] Fallback status update failed:", e);
+
+            console.log(`[Background Process] Triggering backend AI assessment (Attempt ${attempt + 1}/${maxRetries + 1})...`);
+            const response = await fetch('/api/assess', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ interviewId })
+            });
+
+            if (!response.ok) {
+              throw new Error(`Assessment API returned non-ok status: ${response.status}`);
+            }
+
+            console.log("[Background Process] Backend AI assessment trigger completed successfully!");
+            success = true;
+          } catch (err: any) {
+            console.error(`[Background Process] Attempt ${attempt + 1} failed:`, err);
+            lastError = err;
+            attempt++;
+          }
+        }
+
+        // If all retries failed, transition the interview to completed but mark assessmentStatus as failed
+        if (!success) {
+          console.error(`[Background Process] CRITICAL: All AI assessment attempts failed after ${maxRetries} retries. Last error:`, lastError);
+          try {
+            console.log(`[Background Process] Setting interview ${interviewId} status to 'completed' and assessmentStatus to 'failed'...`);
+            await updateDoc(doc(db, 'interviews', interviewId), {
+              status: 'completed',
+              assessmentStatus: 'failed'
+            });
+            console.log("[Background Process] Successfully marked assessment as failed in Firestore.");
+          } catch (dbErr) {
+            console.error("[Background Process] Failed to write assessmentStatus 'failed' to Firestore:", dbErr);
           }
         }
       })();
@@ -691,7 +765,7 @@ YOUR INTERVIEW FLOW:
   b. The interview type (${info.interviewType} Interview)
   c. The total duration (${info.duration} minutes)
   d. Reassuring guidance on response length: "Feel free to take a moment to think, and aim to keep answers focused — a couple of minutes per question is plenty."
-- Make sure this opening greeting feels settling, warm, and not rushed. Do NOT ask any questions yet in this first greeting turn. Give the candidate a warm moment to settle and simply invite them to state when they are ready to begin.
+- Your first message must ONLY be the warm welcome and orientation (greeting, role, interview type, duration, response-length guidance). Do NOT ask your first interview question in this same message. End your first turn after the orientation, and wait for the candidate to respond (even a brief acknowledgment like 'okay' or 'I'm ready' is fine). Make sure this opening greeting feels settling, warm, and not rushed. Give the candidate a warm moment to settle and simply invite them to state when they are ready to begin.
 
 2. INTERVIEW STRUCTURE & TONE:
 - Ask exactly ${targetQuestions} questions in total during this interview session.
@@ -763,7 +837,7 @@ ${existingTranscript.map(t => `[${t.sender}]: ${t.text}`).join('\n')}
           const isResuming = transcriptRef.current.length > 0;
           const seedMessageText = isResuming
             ? "The connection was lost and I have reconnected. Please resume the conversation exactly where we left off, taking into account the conversation history provided in your instructions."
-            : "Hello. I am ready to begin the interview. Please welcome me, introduce yourself as InterviewAI, state the role I am interviewing for, and ask the first question.";
+            : "Hello. I am ready to begin the interview. Please give me your warm welcome and orientation, and let me know when we are ready to start. Do not ask any questions yet.";
 
           console.log(`[WS Live] Gemini Live API Setup Complete. Resuming? ${isResuming}. Sending seed clientContent turn to initiate AI speech...`);
           const seedMessage = {
@@ -1060,7 +1134,7 @@ registerProcessor('mic-processor', MicProcessor);
                   role: "user",
                   parts: [
                     {
-                      text: "[SYSTEM NOTE: The candidate has been silent for more than 20 seconds. Gently re-engage them by checking in, e.g., 'Take your time — would you like me to repeat the question?' or similar. Keep it warm, polite, and brief.]"
+                      text: "[SYSTEM NOTE: Generate a natural, unique check-in in your own conversational style to gently nudge/re-engage the candidate. Keep it warm, polite, brief, and varied (do not repeat standard phrases).]"
                     }
                   ]
                 }

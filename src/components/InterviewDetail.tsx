@@ -121,7 +121,11 @@ export default function InterviewDetail({ interviewId, onDeleteSuccess }: Interv
                   Uploading Video
                 </span>
               )}
-              {interview.decision === 'hire' ? (
+              {interview.assessmentStatus === 'failed' ? (
+                <div className="inline-flex items-center px-4 py-1.5 bg-rose-50 text-rose-700 rounded-full font-bold text-xs uppercase tracking-wide border border-rose-200">
+                  Assessment Failed
+                </div>
+              ) : interview.decision === 'hire' ? (
                 <div className="inline-flex items-center px-4 py-1.5 bg-emerald-100 text-emerald-700 rounded-full font-bold text-xs uppercase tracking-wide border border-emerald-200">
                   Strong Hire
                 </div>
@@ -138,7 +142,7 @@ export default function InterviewDetail({ interviewId, onDeleteSuccess }: Interv
               </button>
             </div>
           )}
-          {isCompleted && (
+          {isCompleted && interview.assessmentStatus !== 'failed' && (
             <div className="text-4xl font-black text-slate-900 mt-2">
               {averageScore}
               <span className="text-lg text-slate-400 font-normal">/100</span>
@@ -180,6 +184,15 @@ export default function InterviewDetail({ interviewId, onDeleteSuccess }: Interv
                 <Video className="h-8 w-8 text-slate-400 mx-auto mb-3" />
                 <p className="text-sm text-slate-600 font-semibold">Active Session in Pending State</p>
                 <p className="text-xs text-slate-400 mt-1">Once the candidate submits their real-time session, the automated dossier rating will generate instantly.</p>
+              </div>
+            ) : interview.assessmentStatus === 'failed' ? (
+              <div className="text-center py-16 bg-rose-50/50 rounded-xl border border-rose-100 p-6 max-w-2xl mx-auto">
+                <AlertTriangle className="h-10 w-10 text-rose-500 mx-auto mb-3" />
+                <p className="text-sm text-rose-800 font-bold">AI Evaluation Report Generation Failed</p>
+                <p className="text-xs text-rose-600 mt-2 leading-relaxed">
+                  We encountered an error generating the automated assessment dossier for this candidate.
+                  You can still view the full interview dialogue recording and text transcript under the <strong>"Full Interview Record"</strong> tab above.
+                </p>
               </div>
             ) : (
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">

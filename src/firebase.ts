@@ -19,8 +19,9 @@ export const auth = getAuth(app);
 
 // Use custom Firestore Database ID if present
 const databaseId = "ai-studio-interviewai-8c2a3b00-8d1c-4052-9862-9c10f4636ec7";
-export const db = initializeFirestore(app, {
+const isBrowser = typeof window !== 'undefined';
+export const db = initializeFirestore(app, isBrowser ? {
   experimentalForceLongPolling: true,
-}, databaseId || undefined);
+} : {}, databaseId || undefined);
 
 export const storage = getStorage(app);

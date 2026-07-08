@@ -36,6 +36,33 @@ try {
 
 const execPromise = promisify(exec);
 
+function isTransientDriveError(err: any): boolean {
+  if (!err) return false;
+  
+  // Check HTTP status code
+  const status = err.status || err.statusCode || (err.response && err.response.status);
+  if (status === 503 || status === 502 || status === 504 || status === 429 || status === 408) {
+    return true;
+  }
+  
+  // Check specific Google API error reasons
+  if (err.errors && Array.isArray(err.errors)) {
+    for (const e of err.errors) {
+      if (e.reason === 'transientError' || e.reason === 'rateLimitExceeded' || e.reason === 'userRateLimitExceeded') {
+        return true;
+      }
+    }
+  }
+  
+  // Inspect message text for indications of a transient failure
+  const msg = (err.message || String(err)).toLowerCase();
+  if (msg.includes('transient') || msg.includes('rate limit') || msg.includes('timeout') || msg.includes('503') || msg.includes('502') || msg.includes('504')) {
+    return true;
+  }
+  
+  return false;
+}
+
 dotenv.config();
 
 function safeClose(socket: WebSocket, code: number, reason?: string | Buffer) {
@@ -97,6 +124,8 @@ app.post("/api/assess", async (req, res) => {
     return res.status(500).json({ error: "Gemini API client is not configured" });
   }
 
+  let interviewDataForLog: any = null;
+
   try {
     // 1. Fetch interview details from Firestore
     const docRef = doc(db, "interviews", interviewId);
@@ -109,10 +138,21 @@ app.post("/api/assess", async (req, res) => {
     const interview = docSnap.data();
     const transcript = interview.transcript || [];
 
+    interviewDataForLog = {
+      applicantName: interview.applicantName,
+      jobTitle: interview.jobTitle,
+      interviewType: interview.interviewType,
+      status: interview.status,
+      recordingStatus: interview.recordingStatus,
+      transcriptLength: transcript.length,
+      hasDescription: !!interview.jobDescription
+    };
+
     if (transcript.length === 0) {
       // Handle empty transcript gracefully
       const updateFields: any = {
         status: "completed",
+        assessmentStatus: "ready",
         summary: "No interview conversation occurred.",
         scoreBreakdown: [
           { criteria: "Engagement", score: 1, feedback: "Candidate did not speak during the session." }
@@ -169,12 +209,22 @@ Provide a comprehensive, professional, and objective analysis of the candidate's
       throw new Error("No response text from Gemini");
     }
 
+    let parsedText = responseText.trim();
+    // Clean up potential markdown code block backticks if present
+    if (parsedText.startsWith("```")) {
+      const match = parsedText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+      if (match && match[1]) {
+        parsedText = match[1].trim();
+      }
+    }
+
     // Parse the JSON result
-    const assessment = JSON.parse(responseText.trim());
+    const assessment = JSON.parse(parsedText);
 
     // 5. Update interview document with assessment results
     const updateFields: any = {
       status: "completed",
+      assessmentStatus: "ready",
       summary: assessment.summary,
       scoreBreakdown: assessment.scoreBreakdown,
       decision: assessment.decision,
@@ -185,15 +235,16 @@ Provide a comprehensive, professional, and objective analysis of the candidate's
 
     res.json({ success: true, assessment });
   } catch (error: any) {
-    console.error("Error in AI assessment:", error);
+    console.error(`[Server AI Assessment] CRITICAL 500 ERROR for interview ${interviewId}:`, error);
     if (error instanceof Error) {
-      console.error("Error Name:", error.name);
-      console.error("Error Message:", error.message);
-      console.error("Error Stack:", error.stack);
+      console.error("[Server AI Assessment] Stack Trace:", error.stack);
     }
+    console.error("[Server AI Assessment] Data available at time of failure:", JSON.stringify(interviewDataForLog || { interviewId }));
+
     res.status(500).json({
       error: error.message || "Failed to complete AI assessment",
-      details: error.stack || String(error)
+      details: error.stack || String(error),
+      availableData: interviewDataForLog
     });
   }
 });
@@ -670,44 +721,94 @@ app.post("/api/upload-video-chunk", express.raw({ type: "*/*", limit: "15mb" }),
 
     const drive = google.drive({ version: "v3", auth });
 
-    // 1. Create file in Google Drive Shared Folder
+    // 1. Create file in Google Drive Shared Folder with retry logic
     console.log(`[Server Chunk Upload] Uploading file to Google Drive Shared Folder ID: ${folderId}`);
     const fileMetadata = {
       name: finalFileName,
       parents: [folderId],
     };
 
-    const media = {
-      mimeType: finalMimeType,
-      body: fs.createReadStream(finalUploadFilePath),
-    };
+    let fileId: string | undefined;
+    const maxDriveRetries = 3;
+    let driveAttempt = 0;
 
-    const createResponse = await drive.files.create({
-      supportsAllDrives: true, // Crucial for Shared Drives!
-      requestBody: fileMetadata,
-      media: media,
-      fields: "id",
-    });
+    while (driveAttempt <= maxDriveRetries) {
+      try {
+        console.log(`[Server Chunk Upload] Drive files.create (Attempt ${driveAttempt + 1}/${maxDriveRetries + 1})...`);
+        const media = {
+          mimeType: finalMimeType,
+          body: fs.createReadStream(finalUploadFilePath),
+        };
+        const createResponse = await drive.files.create({
+          supportsAllDrives: true, // Crucial for Shared Drives!
+          requestBody: fileMetadata,
+          media: media,
+          fields: "id",
+        });
 
-    const fileId = createResponse.data.id;
-    if (!fileId) {
-      throw new Error("Failed to get file ID from Drive files.create response");
+        fileId = createResponse.data.id ?? undefined;
+        if (!fileId) {
+          throw new Error("Failed to get file ID from Drive files.create response");
+        }
+
+        if (driveAttempt > 0) {
+          console.log(`[Server Chunk Upload] Google Drive file creation succeeded on retry attempt ${driveAttempt}! File ID: ${fileId}`);
+        } else {
+          console.log(`[Server Chunk Upload] Successfully created file on Drive. File ID: ${fileId}`);
+        }
+        break; // Success
+      } catch (err: any) {
+        const isTransient = isTransientDriveError(err);
+        console.error(`[Server Chunk Upload] Drive files.create Attempt ${driveAttempt + 1} failed (Transient? ${isTransient}). Error:`, err.message || err);
+
+        if (isTransient && driveAttempt < maxDriveRetries) {
+          driveAttempt++;
+          const backoffMs = Math.pow(2, driveAttempt) * 1000; // 2s, 4s, 8s
+          console.log(`[Server Chunk Upload] Retrying Drive files.create in ${backoffMs}ms...`);
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        } else {
+          console.error(`[Server Chunk Upload] Drive files.create permanently failed or retries exhausted.`);
+          throw err;
+        }
+      }
     }
 
-    console.log(`[Server Chunk Upload] Successfully created file on Drive. File ID: ${fileId}`);
+    // 2. Set domain-level permissions with retry logic
+    let permissionsAttempt = 0;
+    while (permissionsAttempt <= maxDriveRetries) {
+      try {
+        console.log(`[Server Chunk Upload] Setting domain-level 'reader' permissions for workpodd.com on file: ${fileId} (Attempt ${permissionsAttempt + 1}/${maxDriveRetries + 1})`);
+        await drive.permissions.create({
+          fileId: fileId!,
+          supportsAllDrives: true,
+          requestBody: {
+            role: "reader",
+            type: "domain",
+            domain: "workpodd.com",
+          },
+        });
 
-    // 2. Set domain-level permissions
-    console.log(`[Server Chunk Upload] Setting domain-level 'reader' permissions for workpodd.com on file: ${fileId}`);
-    await drive.permissions.create({
-      fileId: fileId,
-      supportsAllDrives: true,
-      requestBody: {
-        role: "reader",
-        type: "domain",
-        domain: "workpodd.com",
-      },
-    });
-    console.log(`[Server Chunk Upload] Successfully configured permissions for workpodd.com`);
+        if (permissionsAttempt > 0) {
+          console.log(`[Server Chunk Upload] Drive permissions.create succeeded on retry attempt ${permissionsAttempt}!`);
+        } else {
+          console.log(`[Server Chunk Upload] Successfully configured permissions for workpodd.com`);
+        }
+        break; // Success
+      } catch (err: any) {
+        const isTransient = isTransientDriveError(err);
+        console.error(`[Server Chunk Upload] Drive permissions.create Attempt ${permissionsAttempt + 1} failed (Transient? ${isTransient}). Error:`, err.message || err);
+
+        if (isTransient && permissionsAttempt < maxDriveRetries) {
+          permissionsAttempt++;
+          const backoffMs = Math.pow(2, permissionsAttempt) * 1000; // 2s, 4s, 8s
+          console.log(`[Server Chunk Upload] Retrying Drive permissions.create in ${backoffMs}ms...`);
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        } else {
+          console.error(`[Server Chunk Upload] Drive permissions.create permanently failed or retries exhausted.`);
+          throw err;
+        }
+      }
+    }
 
     recordingUrl = `https://drive.google.com/file/d/${fileId}/preview`;
     console.log(`[Server Chunk Upload] Generated Drive preview URL: ${recordingUrl}`);

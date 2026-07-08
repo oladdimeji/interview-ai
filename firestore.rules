@@ -1,8 +1,85 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    
+    // Pillar 1: Global Safety Net Default-Deny Catch-All
     match /{document=**} {
-      allow read, write: if true;
+      allow read, write: if false;
+    }
+
+    // Validation Helper Functions
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Rules for Interviews
+    match /interviews/{interviewId} {
+      // Pillar 3 & 8: Access is allowed on list queries and gets for valid document IDs
+      allow read: if isValidId(interviewId);
+      
+      // Pillar 2 & 6: Validate incoming schema on create
+      allow create: if isValidId(interviewId) 
+        && incoming().keys().hasAll(['applicantName', 'jobTitle', 'jobDescription', 'interviewType', 'duration', 'status', 'createdAt', 'transcript'])
+        && incoming().applicantName is string && incoming().applicantName.size() <= 200
+        && incoming().jobTitle is string && incoming().jobTitle.size() <= 200
+        && incoming().jobDescription is string && incoming().jobDescription.size() <= 10000
+        && (incoming().interviewType == 'Technical' || incoming().interviewType == 'Behavioral' || incoming().interviewType == 'Screening')
+        && incoming().duration is int && incoming().duration >= 1 && incoming().duration <= 120
+        && incoming().status == 'pending'
+        && incoming().createdAt is string && incoming().createdAt.size() <= 100
+        && incoming().transcript is list && incoming().transcript.size() == 0;
+
+      // Pillar 4 & 5: Ensure state updates are controlled and size-limited
+      allow update: if isValidId(interviewId)
+        && (
+          // Action: Candidate starts interview
+          (incoming().diff(existing()).affectedKeys().hasOnly(['status', 'startedAt'])
+            && incoming().status == 'in_progress'
+            && incoming().startedAt is int)
+          
+          // Action: Live transcript update (size-limited to prevent memory exhaustion)
+          || (incoming().diff(existing()).affectedKeys().hasOnly(['transcript'])
+            && incoming().transcript is list
+            && incoming().transcript.size() <= 1000)
+          
+          // Action: Candidate completes/finishes the session
+          || (incoming().diff(existing()).affectedKeys().hasAny(['status', 'recordingStatus'])
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'recordingStatus'])
+            && (incoming().status == 'processing' || incoming().status == 'completed')
+            && (incoming().recordingStatus == 'uploading' || incoming().recordingStatus == 'ready' || incoming().recordingStatus == 'failed' || incoming().recordingStatus == 'local_only'))
+          
+          // Action: CV Text/Url server-side extraction
+          || (incoming().diff(existing()).affectedKeys().hasAny(['cvText', 'cvFileUrl'])
+            && incoming().diff(existing()).affectedKeys().hasOnly(['cvText', 'cvFileUrl']))
+
+          // Action: Server-side video upload progress update
+          || (incoming().diff(existing()).affectedKeys().hasAny(['recordingUrl', 'recordingStatus'])
+            && incoming().diff(existing()).affectedKeys().hasOnly(['recordingUrl', 'recordingStatus'])
+            && (incoming().recordingStatus == 'ready' || incoming().recordingStatus == 'failed'))
+
+          // Action: Server-side AI evaluation report generation
+          || (incoming().diff(existing()).affectedKeys().hasAny(['status', 'summary', 'scoreBreakdown', 'decision', 'decisionReasoning', 'assessmentStatus'])
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'summary', 'scoreBreakdown', 'decision', 'decisionReasoning', 'recordingStatus', 'assessmentStatus'])
+            && incoming().status == 'completed'
+            && (incoming().get('assessmentStatus', 'ready') == 'ready' || incoming().get('assessmentStatus', 'ready') == 'failed')
+            && (incoming().get('assessmentStatus', 'ready') == 'failed' || (
+              incoming().summary is string
+              && incoming().scoreBreakdown is list
+              && (incoming().decision == 'hire' || incoming().decision == 'no_hire')
+              && incoming().decisionReasoning is string
+            )))
+        );
+
+      // Pillar 1: Deletion is restricted to valid document IDs
+      allow delete: if isValidId(interviewId);
     }
   }
 }
