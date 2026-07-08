@@ -27,4 +27,6 @@ export interface Interview {
   scoreBreakdown?: ScoreCriterion[];
   decision?: 'hire' | 'no_hire';
   decisionReasoning?: string;
+  cvText?: string | null;
+  cvFileUrl?: string | null;
 }

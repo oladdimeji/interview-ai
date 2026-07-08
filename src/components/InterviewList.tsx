@@ -2,18 +2,21 @@ import { useEffect, useState } from 'react';
 import { db } from '../firebase';
 import { collection, query, orderBy, onSnapshot } from 'firebase/firestore';
 import { Interview } from '../types';
-import { ListFilter, Calendar, ChevronRight, Hourglass, Video, CheckCircle2 } from 'lucide-react';
+import { ListFilter, Calendar, ChevronRight, Hourglass, Video, CheckCircle2, Trash2, AlertTriangle } from 'lucide-react';
 
 interface InterviewListProps {
   onSelectInterview: (interview: Interview) => void;
   selectedInterviewId?: string;
+  onDeleteSuccess?: () => void;
   key?: number | string;
 }
 
-export default function InterviewList({ onSelectInterview, selectedInterviewId }: InterviewListProps) {
+export default function InterviewList({ onSelectInterview, selectedInterviewId, onDeleteSuccess }: InterviewListProps) {
   const [interviews, setInterviews] = useState<Interview[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<'all' | 'pending' | 'in_progress' | 'completed'>('all');
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   useEffect(() => {
     // Live subscriber for interviews collection ordered by creation date desc
@@ -153,25 +156,85 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId }
                 </div>
 
                 <div className="flex items-center gap-3">
-                  {(interview.status === 'pending' || interview.status === 'in_progress') && (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        window.history.pushState({}, '', `/interview/${interview.id}`);
-                        window.dispatchEvent(new Event('popstate'));
-                      }}
-                      title="Test / Preview Interview"
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold text-xs rounded-md border border-indigo-100 transition-colors cursor-pointer"
-                    >
-                      <Video className="h-3.5 w-3.5" /> Test / Preview
-                    </button>
-                  )}
                   {getStatusBadge(interview.status)}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setDeletingId(interview.id);
+                    }}
+                    title="Delete Interview"
+                    className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
                   <ChevronRight className={`h-5 w-5 text-slate-400 transition-transform ${isSelected ? 'translate-x-1 text-indigo-600' : ''}`} />
                 </div>
               </div>
             );
           })}
+        </div>
+      )}
+
+      {deletingId && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl shadow-lg border border-slate-200 p-6 max-w-md w-full animate-in fade-in zoom-in duration-150">
+            <div className="flex items-start gap-4">
+              <div className="h-10 w-10 rounded-full bg-rose-50 text-rose-600 flex items-center justify-center shrink-0">
+                <AlertTriangle className="h-5 w-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Delete this interview?</h3>
+                <p className="text-xs text-slate-500 mt-2 leading-relaxed">
+                  This will permanently remove the interview, its transcript, and its recording. This cannot be undone.
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-3 mt-6">
+              <button
+                disabled={isDeleting}
+                onClick={() => setDeletingId(null)}
+                className="px-4 py-2 text-xs font-semibold border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-700 cursor-pointer transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                disabled={isDeleting}
+                onClick={async () => {
+                  setIsDeleting(true);
+                  try {
+                    const res = await fetch(`/api/interviews/${deletingId}`, {
+                      method: 'DELETE',
+                    });
+                    if (!res.ok) {
+                      throw new Error('Failed to delete interview');
+                    }
+                    if (selectedInterviewId === deletingId && onDeleteSuccess) {
+                      onDeleteSuccess();
+                    }
+                  } catch (err) {
+                    console.error('Error deleting interview:', err);
+                    alert('Failed to delete interview. Please try again.');
+                  } finally {
+                    setIsDeleting(false);
+                    setDeletingId(null);
+                  }
+                }}
+                className="px-4 py-2 text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white rounded-lg cursor-pointer transition-colors flex items-center gap-1.5 disabled:opacity-50"
+              >
+                {isDeleting ? (
+                  <>
+                    <svg className="animate-spin -ml-0.5 mr-1.5 h-3.5 w-3.5 text-white" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                    Deleting...
+                  </>
+                ) : (
+                  'Delete'
+                )}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

@@ -6,9 +6,35 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import fs from "fs";
-import { doc, getDoc, updateDoc } from "firebase/firestore";
-import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
-import { db, storage } from "./src/firebase.js";
+import { doc, getDoc, updateDoc, deleteDoc, collection, addDoc } from "firebase/firestore";
+import { db } from "./src/firebase.js";
+import { google } from "googleapis";
+import { exec } from "child_process";
+import { promisify } from "util";
+import multer from "multer";
+import { Readable } from "stream";
+import { createRequire } from "module";
+
+let pdf: any;
+let mammoth: any;
+
+try {
+  // @ts-ignore
+  const req = createRequire(import.meta.url);
+  pdf = req("pdf-parse");
+  mammoth = req("mammoth");
+} catch (e) {
+  try {
+    // @ts-ignore
+    pdf = require("pdf-parse");
+    // @ts-ignore
+    mammoth = require("mammoth");
+  } catch (err) {
+    console.error("Failed to load pdf-parse or mammoth libraries:", err);
+  }
+}
+
+const execPromise = promisify(exec);
 
 dotenv.config();
 
@@ -37,13 +63,26 @@ app.use(express.json());
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: "/api/live" });
 
-// Initialize Gemini API client
 const apiKey = process.env.GEMINI_API_KEY;
-const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
+
+// Helper to lazily initialize the Gemini API client
+function getGeminiClient() {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) return null;
+  return new GoogleGenAI({
+    apiKey: key,
+    httpOptions: {
+      headers: {
+        "User-Agent": "aistudio-build",
+      },
+    },
+  });
+}
 
 // API routes
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", geminiConfigured: !!ai });
+  const aiClient = getGeminiClient();
+  res.json({ status: "ok", geminiConfigured: !!aiClient });
 });
 
 // AI Assessment Endpoint
@@ -53,7 +92,8 @@ app.post("/api/assess", async (req, res) => {
     return res.status(400).json({ error: "interviewId is required" });
   }
 
-  if (!ai) {
+  const aiClient = getGeminiClient();
+  if (!aiClient) {
     return res.status(500).json({ error: "Gemini API client is not configured" });
   }
 
@@ -116,8 +156,8 @@ Provide a comprehensive, professional, and objective analysis of the candidate's
 `;
 
     // 4. Generate Content
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+    const response = await aiClient.models.generateContent({
+      model: "gemini-3.5-flash",
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -146,7 +186,297 @@ Provide a comprehensive, professional, and objective analysis of the candidate's
     res.json({ success: true, assessment });
   } catch (error: any) {
     console.error("Error in AI assessment:", error);
-    res.status(500).json({ error: error.message || "Failed to complete AI assessment" });
+    if (error instanceof Error) {
+      console.error("Error Name:", error.name);
+      console.error("Error Message:", error.message);
+      console.error("Error Stack:", error.stack);
+    }
+    res.status(500).json({
+      error: error.message || "Failed to complete AI assessment",
+      details: error.stack || String(error)
+    });
+  }
+});
+
+// Multer setup for handling CV upload
+const multerStorage = multer.memoryStorage();
+const upload = multer({
+  storage: multerStorage,
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB limit
+  },
+});
+
+// Helper for extracting text from PDF/DOCX buffer
+async function extractTextFromBuffer(buffer: Buffer, originalname: string, mimetype: string): Promise<string | null> {
+  const ext = path.extname(originalname).toLowerCase();
+  
+  let pdfParser = pdf;
+  if (typeof pdfParser !== 'function' && (pdfParser as any).default) {
+    pdfParser = (pdfParser as any).default;
+  }
+
+  let mammothExtractor = mammoth;
+  if (!mammothExtractor.extractRawText && (mammothExtractor as any).default) {
+    mammothExtractor = (mammothExtractor as any).default;
+  }
+
+  try {
+    if (ext === ".pdf" || mimetype === "application/pdf") {
+      console.log(`[CV Text Extraction] Extracting text from PDF of length ${buffer.length}`);
+      let text = "";
+      if (typeof pdfParser === 'function') {
+        const data = await pdfParser(buffer);
+        text = data.text;
+      } else if (pdfParser && typeof pdfParser.PDFParse === 'function') {
+        const parserInstance = new pdfParser.PDFParse({ data: buffer });
+        const result = await parserInstance.getText();
+        text = result.text;
+      } else {
+        throw new Error("No suitable PDF parser found in the pdf-parse module.");
+      }
+      console.log(`[CV Text Extraction] Extracted ${text ? text.length : 0} characters from PDF.`);
+      return text || null;
+    } else if (ext === ".docx" || mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || ext === ".doc") {
+      console.log(`[CV Text Extraction] Extracting text from DOCX of length ${buffer.length}`);
+      const result = await mammothExtractor.extractRawText({ buffer });
+      const text = result.value;
+      console.log(`[CV Text Extraction] Extracted ${text ? text.length : 0} characters from DOCX.`);
+      return text || null;
+    } else {
+      console.log(`[CV Text Extraction] Unsupported extension or mimetype for extraction: ${ext} / ${mimetype}`);
+      return null;
+    }
+  } catch (err: any) {
+    console.error(`[CV Text Extraction] Error during text extraction for ${originalname}:`, err);
+    return null;
+  }
+}
+
+// Helper for uploading CV to Google Drive
+async function uploadCvToDrive(interviewId: string, fileBuffer: Buffer, fileName: string, mimeType: string): Promise<string> {
+  const serviceAccountKeyRaw = process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY;
+  const folderId = process.env.DRIVE_RECORDINGS_FOLDER_ID;
+
+  if (!serviceAccountKeyRaw) {
+    throw new Error("GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY environment variable is not defined");
+  }
+  if (!folderId) {
+    throw new Error("DRIVE_RECORDINGS_FOLDER_ID environment variable is not defined");
+  }
+
+  const credentials = JSON.parse(serviceAccountKeyRaw);
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ["https://www.googleapis.com/auth/drive"],
+  });
+
+  const drive = google.drive({ version: "v3", auth });
+
+  const fileMetadata = {
+    name: `cvs/${fileName}`,
+    parents: [folderId],
+  };
+
+  const media = {
+    mimeType: mimeType,
+    body: Readable.from(fileBuffer),
+  };
+
+  console.log(`[Server CV Upload] Uploading CV file to Google Drive Shared Folder ID: ${folderId}, filename: cvs/${fileName}`);
+  const createResponse = await drive.files.create({
+    supportsAllDrives: true,
+    requestBody: fileMetadata,
+    media: media,
+    fields: "id",
+  });
+
+  const fileId = createResponse.data.id;
+  if (!fileId) {
+    throw new Error("Failed to get file ID from Drive files.create response for CV");
+  }
+
+  console.log(`[Server CV Upload] Successfully uploaded CV to Drive. File ID: ${fileId}`);
+
+  // Set domain-level permissions (same as recordings)
+  console.log(`[Server CV Upload] Setting domain-level 'reader' permissions for workpodd.com on CV file: ${fileId}`);
+  await drive.permissions.create({
+    fileId: fileId,
+    supportsAllDrives: true,
+    requestBody: {
+      role: "reader",
+      type: "domain",
+      domain: "workpodd.com",
+    },
+  });
+
+  const cvFileUrl = `https://drive.google.com/file/d/${fileId}/preview`;
+  console.log(`[Server CV Upload] Generated CV Drive preview URL: ${cvFileUrl}`);
+  return cvFileUrl;
+}
+
+// POST /api/interviews - Create new interview with optional CV upload
+app.post("/api/interviews", upload.single("cv"), async (req, res) => {
+  console.log("[Server Create Interview] Received request body:", req.body);
+  const { applicantName, jobTitle, jobDescription, interviewType, duration } = req.body;
+
+  if (!applicantName || !jobTitle || !jobDescription || !interviewType || !duration) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  try {
+    // 1. Create document in Firestore first to get the interview ID
+    console.log("[Server Create Interview] Creating initial document in Firestore...");
+    const colRef = collection(db, "interviews");
+    const docRef = await addDoc(colRef, {
+      applicantName,
+      jobTitle,
+      jobDescription,
+      interviewType,
+      duration: parseInt(duration, 10),
+      status: "pending",
+      createdAt: new Date().toISOString(),
+      transcript: [],
+      cvText: null,
+      cvFileUrl: null,
+    });
+
+    const interviewId = docRef.id;
+    console.log(`[Server Create Interview] Created Firestore interview doc ID: ${interviewId}`);
+
+    let cvText: string | null = null;
+    let cvFileUrl: string | null = null;
+
+    // 2. Process file if uploaded
+    if (req.file) {
+      const file = req.file;
+      console.log(`[Server Create Interview] CV File uploaded: ${file.originalname} (${file.size} bytes)`);
+
+      // 2a. Text Extraction
+      try {
+        const extracted = await extractTextFromBuffer(file.buffer, file.originalname, file.mimetype);
+        if (extracted && extracted.trim()) {
+          cvText = extracted.trim();
+          console.log(`[Server Create Interview] Successfully extracted CV text. Length: ${cvText.length} chars.`);
+        } else {
+          console.warn(`[Server Create Interview] Text extraction returned empty/null for: ${file.originalname}`);
+        }
+      } catch (extractErr: any) {
+        console.error(`[Server Create Interview] Text extraction failed with raw error:`, extractErr);
+      }
+
+      // 2b. File Storage to Google Drive
+      try {
+        const fileExtension = path.extname(file.originalname).toLowerCase() || (file.mimetype === "application/pdf" ? ".pdf" : ".docx");
+        const driveFileName = `${interviewId}${fileExtension}`;
+        cvFileUrl = await uploadCvToDrive(interviewId, file.buffer, driveFileName, file.mimetype);
+        console.log(`[Server Create Interview] CV uploaded to Google Drive. URL: ${cvFileUrl}`);
+      } catch (driveErr: any) {
+        console.error(`[Server Create Interview] Google Drive upload failed with raw error:`, driveErr);
+      }
+
+      // 2c. Update Firestore with cvText and cvFileUrl
+      if (cvText !== null || cvFileUrl !== null) {
+        console.log(`[Server Create Interview] Updating Firestore interviews/${interviewId} with cvText/cvFileUrl...`);
+        await updateDoc(docRef, {
+          cvText,
+          cvFileUrl,
+        });
+        console.log(`[Server Create Interview] Firestore updated successfully with CV details.`);
+      }
+    } else {
+      console.log("[Server Create Interview] No CV file uploaded for this interview.");
+    }
+
+    return res.json({
+      success: true,
+      interviewId,
+      cvTextLength: cvText ? cvText.length : 0,
+      cvFileUrl,
+    });
+
+  } catch (err: any) {
+    console.error("[Server Create Interview] CRITICAL ERROR during creation:", err);
+    return res.status(500).json({
+      error: `Failed to create interview: ${err.message || err}`,
+      details: err.stack || String(err),
+    });
+  }
+});
+
+// DELETE /api/interviews/:id
+app.delete("/api/interviews/:id", async (req, res) => {
+  const interviewId = req.params.id;
+  if (!interviewId) {
+    return res.status(400).json({ error: "Interview ID is required" });
+  }
+
+  console.log(`[Server Delete Interview] Initiating deletion for interview ID: ${interviewId}`);
+
+  let recordingUrl = "";
+  let fileIdToDeleted: string | null = null;
+
+  try {
+    // 1. Fetch interview details from Firestore to get recordingUrl
+    const docRef = doc(db, "interviews", interviewId);
+    const docSnap = await getDoc(docRef);
+
+    if (docSnap.exists()) {
+      const interview = docSnap.data();
+      recordingUrl = interview.recordingUrl || "";
+    }
+
+    // 2. Try to extract Google Drive file ID if recordingUrl exists
+    if (recordingUrl && recordingUrl.includes("drive.google.com")) {
+      console.log(`[Server Delete Interview] Found recording URL on Drive: ${recordingUrl}`);
+      // Parse fileId from URL, e.g. https://drive.google.com/file/d/[FILE_ID]/preview
+      const dMatch = recordingUrl.match(/\/d\/([a-zA-Z0-9_-]+)/);
+      if (dMatch && dMatch[1]) {
+        fileIdToDeleted = dMatch[1];
+        console.log(`[Server Delete Interview] Extracted Google Drive file ID: ${fileIdToDeleted}`);
+      }
+    }
+
+    // 3. Delete from Google Drive if fileId was found
+    if (fileIdToDeleted) {
+      try {
+        const serviceAccountKeyRaw = process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY;
+        if (!serviceAccountKeyRaw) {
+          throw new Error("GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY is missing from environment variables");
+        }
+
+        const credentials = JSON.parse(serviceAccountKeyRaw);
+        const auth = new google.auth.GoogleAuth({
+          credentials,
+          scopes: ["https://www.googleapis.com/auth/drive"],
+        });
+
+        const drive = google.drive({ version: "v3", auth });
+        console.log(`[Server Delete Interview] Deleting file from Google Drive: ${fileIdToDeleted}`);
+        await drive.files.delete({
+          fileId: fileIdToDeleted,
+          supportsAllDrives: true,
+        });
+        console.log(`[Server Delete Interview] Google Drive file deleted successfully.`);
+      } catch (driveErr: any) {
+        // Log the failure clearly but don't block the Firestore deletion
+        console.error(`[Server Delete Interview] Failed to delete file from Google Drive (non-blocking):`, driveErr?.message || driveErr);
+      }
+    }
+
+    // 4. Delete Firestore document
+    console.log(`[Server Delete Interview] Deleting Firestore document interviews/${interviewId}`);
+    await deleteDoc(docRef);
+    console.log(`[Server Delete Interview] Firestore document deleted successfully.`);
+
+    return res.json({ success: true });
+
+  } catch (err: any) {
+    console.error(`[Server Delete Interview] CRITICAL ERROR during deletion:`, err);
+    return res.status(500).json({
+      error: `Failed to delete interview: ${err.message || err}`,
+      details: err.stack || String(err)
+    });
   }
 });
 
@@ -261,79 +591,181 @@ app.post("/api/upload-video-chunk", express.raw({ type: "*/*", limit: "15mb" }),
     console.warn(`[Server Chunk Upload] Warning: Failed to clean up temp chunks directory:`, cleanupErr);
   }
 
-  // Upload complete reassembled file to Firebase Storage
-  let videoUrl = `/recordings/${localFileName}`; // Default fallback URL
-  let firebaseUploadSucceeded = false;
-  let fallbackReason = "";
-
-  let bucketName = "gen-lang-client-0637900846.firebasestorage.app";
-  let firebaseApiKey = apiKey;
+  // Transcode reassembled WebM file to MP4 (H.264/AAC) using ffmpeg
+  const localMp4Name = `${interviewId}.mp4`;
+  const localMp4Path = path.join(recordingsDir, localMp4Name);
+  
+  console.log(`[Server Chunk Upload] Transcoding reassembled WebM to MP4: ${localFilePath} -> ${localMp4Path}`);
+  
+  let finalUploadFilePath = localFilePath;
+  let finalMimeType = "video/webm";
+  let finalFileName = `recordings/${interviewId}.webm`;
+  let isTranscoded = false;
 
   try {
-    const configPath = path.join(process.cwd(), "firebase-applet-config.json");
-    if (fs.existsSync(configPath)) {
-      const firebaseConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
-      bucketName = firebaseConfig.storageBucket || bucketName;
-      firebaseApiKey = firebaseConfig.apiKey || firebaseApiKey;
-    }
-  } catch (err) {
-    console.warn(`[Server Chunk Upload] Could not read firebase-applet-config.json, using defaults.`, err);
-  }
-
-  if (bucketName && firebaseApiKey) {
-    const objectPath = encodeURIComponent(`recordings/${interviewId}.webm`);
-    const uploadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o?name=${objectPath}&uploadType=media&key=${firebaseApiKey}`;
+    const startTime = Date.now();
+    const cmd = `ffmpeg -i "${localFilePath}" -vcodec libx264 -acodec aac -preset fast -y "${localMp4Path}"`;
     
-    console.log(`[Server Chunk Upload] Attempting Firebase Storage upload via REST to: ${uploadUrl}`);
-    try {
-      const fullVideoBuffer = fs.readFileSync(localFilePath);
-      const response = await fetch(uploadUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "video/webm",
-        },
-        body: fullVideoBuffer,
-      });
+    await execPromise(cmd);
+    const durationMs = Date.now() - startTime;
+    console.log(`[Server Chunk Upload] ffmpeg conversion completed in ${durationMs}ms.`);
 
-      console.log(`[Server Chunk Upload] Firebase Storage REST Response Status: ${response.status} ${response.statusText}`);
-      const responseData = await response.json() as any;
-      
-      if (response.ok) {
-        firebaseUploadSucceeded = true;
-        const downloadToken = responseData.downloadTokens || (responseData.metadata && responseData.metadata.downloadTokens);
-        videoUrl = `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${objectPath}?alt=media${downloadToken ? `&token=${downloadToken}` : ""}`;
-        console.log(`[Server Chunk Upload] Uploaded to real Firebase Storage. URL: ${videoUrl}`);
-      } else {
-        fallbackReason = `Firebase REST returned status ${response.status}: ${JSON.stringify(responseData)}`;
-        console.error(`[Server Chunk Upload] FELL BACK to local disk — reason: ${fallbackReason}`);
-      }
-    } catch (firebaseErr: any) {
-      fallbackReason = `Firebase REST request threw exception: ${firebaseErr?.message || firebaseErr}`;
-      console.error(`[Server Chunk Upload] FELL BACK to local disk — reason: ${fallbackReason}`);
+    // Log the resulting file size and duration on success
+    const stats = fs.statSync(localMp4Path);
+    const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+    
+    // Get duration via ffprobe
+    let durationSeconds = 0;
+    try {
+      const probeCmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${localMp4Path}"`;
+      const { stdout: probeStdout } = await execPromise(probeCmd);
+      durationSeconds = parseFloat(probeStdout.trim());
+      console.log(`[Server Chunk Upload] Converted MP4 metadata: Size = ${fileSizeMB} MB, Duration = ${durationSeconds} seconds.`);
+    } catch (probeErr: any) {
+      console.warn(`[Server Chunk Upload] Failed to extract duration via ffprobe:`, probeErr?.message || probeErr);
     }
-  } else {
-    fallbackReason = "Firebase storageBucket or apiKey not configured";
-    console.warn(`[Server Chunk Upload] FELL BACK to local disk — reason: ${fallbackReason}`);
+
+    finalUploadFilePath = localMp4Path;
+    finalMimeType = "video/mp4";
+    finalFileName = `recordings/${interviewId}.mp4`;
+    isTranscoded = true;
+
+  } catch (ffmpegErr: any) {
+    console.error(`[Server Chunk Upload] FFmpeg conversion failed. Raw error:`, ffmpegErr);
+    if (ffmpegErr.stderr) {
+      console.error(`[Server Chunk Upload] FFmpeg stderr:`, ffmpegErr.stderr);
+    }
+    // Set status to failed in Firestore if reassembly or transcoding fails
+    try {
+      const docRef = doc(db, "interviews", interviewId);
+      await updateDoc(docRef, {
+        recordingStatus: "failed"
+      });
+    } catch (dbErr) {
+      console.error(`[Server Chunk Upload] Failed to set status to failed in Firestore:`, dbErr);
+    }
+    reassemblingInterviews.delete(interviewId);
+    return res.status(500).json({ error: `FFmpeg transcoding failed: ${ffmpegErr.message || ffmpegErr}` });
   }
 
-  // Update Firestore with the final videoUrl and appropriate recordingStatus ('ready' or 'local_only')
-  const finalStatus = firebaseUploadSucceeded ? "ready" : "local_only";
+  // Upload complete reassembled/transcoded file to Google Drive Shared Drive
+  console.log(`[Server Chunk Upload] Starting Google Drive upload for interview: ${interviewId}`);
+  let recordingUrl = "";
   try {
-    console.log(`[Server Chunk Upload] Updating Firestore document interviews/${interviewId} with recordingUrl: ${videoUrl}, recordingStatus: ${finalStatus}`);
+    const serviceAccountKeyRaw = process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY;
+    const folderId = process.env.DRIVE_RECORDINGS_FOLDER_ID;
+
+    if (!serviceAccountKeyRaw) {
+      throw new Error("GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY environment variable is not defined");
+    }
+    if (!folderId) {
+      throw new Error("DRIVE_RECORDINGS_FOLDER_ID environment variable is not defined");
+    }
+
+    const credentials = JSON.parse(serviceAccountKeyRaw);
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ["https://www.googleapis.com/auth/drive"],
+    });
+
+    const drive = google.drive({ version: "v3", auth });
+
+    // 1. Create file in Google Drive Shared Folder
+    console.log(`[Server Chunk Upload] Uploading file to Google Drive Shared Folder ID: ${folderId}`);
+    const fileMetadata = {
+      name: finalFileName,
+      parents: [folderId],
+    };
+
+    const media = {
+      mimeType: finalMimeType,
+      body: fs.createReadStream(finalUploadFilePath),
+    };
+
+    const createResponse = await drive.files.create({
+      supportsAllDrives: true, // Crucial for Shared Drives!
+      requestBody: fileMetadata,
+      media: media,
+      fields: "id",
+    });
+
+    const fileId = createResponse.data.id;
+    if (!fileId) {
+      throw new Error("Failed to get file ID from Drive files.create response");
+    }
+
+    console.log(`[Server Chunk Upload] Successfully created file on Drive. File ID: ${fileId}`);
+
+    // 2. Set domain-level permissions
+    console.log(`[Server Chunk Upload] Setting domain-level 'reader' permissions for workpodd.com on file: ${fileId}`);
+    await drive.permissions.create({
+      fileId: fileId,
+      supportsAllDrives: true,
+      requestBody: {
+        role: "reader",
+        type: "domain",
+        domain: "workpodd.com",
+      },
+    });
+    console.log(`[Server Chunk Upload] Successfully configured permissions for workpodd.com`);
+
+    recordingUrl = `https://drive.google.com/file/d/${fileId}/preview`;
+    console.log(`[Server Chunk Upload] Generated Drive preview URL: ${recordingUrl}`);
+
+    // Clean up local files (both original webm and converted mp4)
+    try {
+      if (fs.existsSync(localFilePath)) {
+        fs.unlinkSync(localFilePath);
+        console.log(`[Server Chunk Upload] Cleaned up local reassembled WebM file: ${localFilePath}`);
+      }
+      if (isTranscoded && fs.existsSync(localMp4Path)) {
+        fs.unlinkSync(localMp4Path);
+        console.log(`[Server Chunk Upload] Cleaned up local transcoded MP4 file: ${localMp4Path}`);
+      }
+    } catch (cleanupErr) {
+      console.warn(`[Server Chunk Upload] Failed to clean up local files:`, cleanupErr);
+    }
+
+    // Update Firestore document with recordingUrl and recordingStatus 'ready'
+    console.log(`[Server Chunk Upload] Updating Firestore document interviews/${interviewId} with recordingUrl: ${recordingUrl}, recordingStatus: ready`);
     const docRef = doc(db, "interviews", interviewId);
     await updateDoc(docRef, {
-      recordingUrl: videoUrl,
-      recordingStatus: finalStatus
+      recordingUrl: recordingUrl,
+      recordingStatus: "ready"
     });
-    console.log(`[Server Chunk Upload] Firestore document successfully updated to ${finalStatus}!`);
-  } catch (dbErr) {
-    console.error(`[Server Chunk Upload] Failed to update Firestore with recording details:`, dbErr);
+    console.log(`[Server Chunk Upload] Firestore document successfully updated to ready!`);
+
+    // Clean up reassembling guard
+    reassemblingInterviews.delete(interviewId);
+
+    return res.json({ success: true, url: recordingUrl });
+
+  } catch (driveErr: any) {
+    // Clean up reassembling guard
+    reassemblingInterviews.delete(interviewId);
+
+    console.error(`[Server Chunk Upload] CRITICAL ERROR uploading to Google Drive:`, driveErr);
+    if (driveErr.response) {
+      console.error(`[Server Chunk Upload] Google API Error Response Data:`, JSON.stringify(driveErr.response.data || driveErr.response));
+    }
+
+    // Update Firestore to let the admin know the recording failed
+    try {
+      console.log(`[Server Chunk Upload] Updating Firestore document interviews/${interviewId} with recordingStatus: failed`);
+      const docRef = doc(db, "interviews", interviewId);
+      await updateDoc(docRef, {
+        recordingStatus: "failed"
+      });
+    } catch (dbErr) {
+      console.error(`[Server Chunk Upload] Failed to set status to failed in Firestore:`, dbErr);
+    }
+
+    return res.status(500).json({
+      error: `Google Drive upload failed: ${driveErr.message || driveErr}`,
+      details: driveErr.stack || String(driveErr),
+      rawError: driveErr.response?.data || driveErr
+    });
   }
-
-  // Clean up reassembling guard
-  reassemblingInterviews.delete(interviewId);
-
-  res.json({ success: true, url: videoUrl, fallbackUsed: !firebaseUploadSucceeded });
 });
 
 // WebSocket proxy logic

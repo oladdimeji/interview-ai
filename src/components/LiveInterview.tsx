@@ -14,21 +14,20 @@ interface LiveInterviewProps {
 
 // PCM Audio Helper queue player
 class AudioQueuePlayer {
-  private audioCtx: AudioContext | null = null;
+  private audioCtx: AudioContext;
   private nextPlayTime: number = 0;
   private onStateChange: (isPlaying: boolean) => void;
   private activeSources: AudioBufferSourceNode[] = [];
+  private recordingDestination: MediaStreamAudioDestinationNode | null = null;
 
-  constructor(onStateChange: (isPlaying: boolean) => void) {
+  constructor(audioCtx: AudioContext, recordingDestination: MediaStreamAudioDestinationNode | null, onStateChange: (isPlaying: boolean) => void) {
+    this.audioCtx = audioCtx;
+    this.recordingDestination = recordingDestination;
     this.onStateChange = onStateChange;
+    this.nextPlayTime = this.audioCtx.currentTime;
   }
 
   playChunk(float32Array: Float32Array) {
-    if (!this.audioCtx) {
-      this.audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      this.nextPlayTime = this.audioCtx.currentTime;
-    }
-
     if (this.audioCtx.state === 'suspended') {
       this.audioCtx.resume();
     }
@@ -39,6 +38,10 @@ class AudioQueuePlayer {
     const source = this.audioCtx.createBufferSource();
     source.buffer = buffer;
     source.connect(this.audioCtx.destination);
+    
+    if (this.recordingDestination) {
+      source.connect(this.recordingDestination);
+    }
 
     const startTime = Math.max(this.audioCtx.currentTime, this.nextPlayTime);
     source.start(startTime);
@@ -60,6 +63,11 @@ class AudioQueuePlayer {
     this.nextPlayTime = startTime + chunkDuration;
   }
 
+  isPlayingOrQueued(): boolean {
+    if (this.audioCtx.state === 'closed') return false;
+    return this.activeSources.length > 0 || this.nextPlayTime > this.audioCtx.currentTime;
+  }
+
   clear() {
     this.activeSources.forEach(source => {
       try { source.stop(); } catch (e) {}
@@ -67,10 +75,6 @@ class AudioQueuePlayer {
     this.activeSources = [];
     this.nextPlayTime = 0;
     this.onStateChange(false);
-    if (this.audioCtx) {
-      try { this.audioCtx.close(); } catch (e) {}
-      this.audioCtx = null;
-    }
   }
 }
 
@@ -119,6 +123,9 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
   const micMutedRef = useRef(micMuted);
   useEffect(() => {
     micMutedRef.current = micMuted;
+    if (micGainNodeRef.current) {
+      micGainNodeRef.current.gain.value = micMuted ? 0 : 1;
+    }
   }, [micMuted]);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   
@@ -130,6 +137,8 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
   const audioPlayerRef = useRef<AudioQueuePlayer | null>(null);
   const micAudioContextRef = useRef<AudioContext | null>(null);
   const micProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const micWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const micGainNodeRef = useRef<GainNode | null>(null);
   const micChunkCountRef = useRef<number>(0);
 
   // High-precision unique chronological transcript system
@@ -137,6 +146,13 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
   const activeAiEntryRef = useRef<TranscriptEntry | null>(null);
   const activeCandidateEntryRef = useRef<TranscriptEntry | null>(null);
   const lastTimestampRef = useRef<number>(0);
+
+  const lastAiSpokeTimeRef = useRef<number>(Date.now());
+  const lastCandidateActivityTimeRef = useRef<number>(Date.now());
+  const lastSilenceTriggeredTimeRef = useRef<number>(0);
+  const candidateTurnStartTimeRef = useRef<number>(0);
+  const lastOverLengthTriggeredTimeRef = useRef<number>(0);
+  const isAiSpeakingRef = useRef<boolean>(false);
 
   const getUniqueTimestamp = (): number => {
     const now = Date.now();
@@ -155,38 +171,98 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
     if (!text) return;
 
     const isAI = sender === 'AI';
+    if (!isAI) {
+      lastCandidateActivityTimeRef.current = Date.now();
+      if (candidateTurnStartTimeRef.current === 0) {
+        candidateTurnStartTimeRef.current = Date.now();
+      }
+    }
+
     const activeRef = isAI ? activeAiEntryRef : activeCandidateEntryRef;
     const otherRef = isAI ? activeCandidateEntryRef : activeAiEntryRef;
 
-    if (activeRef.current === null) {
-      // Finalize the other role's active utterance
-      otherRef.current = null;
+    let cleanedText = text;
+    let markerDetected = false;
+    const marker = '[INTERVIEW_COMPLETE]';
 
-      const timestamp = getUniqueTimestamp();
-      const newEntry: TranscriptEntry = {
-        sender,
-        text,
-        timestamp
-      };
-      activeRef.current = newEntry;
-
-      console.log(`New transcript entry started: [${sender}] at [${timestamp}]`);
-      updateTranscript([...transcriptRef.current, newEntry]);
-    } else {
-      const activeEntry = activeRef.current;
-      const currentText = activeEntry.text;
-
-      if (!currentText.endsWith(text)) {
-        activeEntry.text += text;
+    if (isAI) {
+      if (cleanedText.includes(marker)) {
+        console.log("[WS Live] AI conclusion marker detected in incoming chunk.");
+        markerDetected = true;
+        cleanedText = cleanedText.replace(marker, '');
       }
+    }
 
-      const updated = transcriptRef.current.map(entry => {
-        if (entry.timestamp === activeEntry.timestamp) {
-          return { ...entry, text: activeEntry.text };
+    if (cleanedText) {
+      if (activeRef.current === null) {
+        // Finalize the other role's active utterance
+        otherRef.current = null;
+
+        const timestamp = getUniqueTimestamp();
+        const newEntry: TranscriptEntry = {
+          sender,
+          text: cleanedText,
+          timestamp
+        };
+        activeRef.current = newEntry;
+
+        console.log(`New transcript entry started: [${sender}] at [${timestamp}]`);
+        updateTranscript([...transcriptRef.current, newEntry]);
+      } else {
+        const activeEntry = activeRef.current;
+        const currentText = activeEntry.text;
+
+        if (!currentText.endsWith(cleanedText)) {
+          activeEntry.text += cleanedText;
         }
-        return entry;
-      });
-      updateTranscript(updated);
+
+        if (isAI && activeEntry.text.includes(marker)) {
+          console.log("[WS Live] AI conclusion marker detected in accumulated active text.");
+          markerDetected = true;
+          activeEntry.text = activeEntry.text.replace(marker, '');
+        }
+
+        const updated = transcriptRef.current.map(entry => {
+          if (entry.timestamp === activeEntry.timestamp) {
+            return { ...entry, text: activeEntry.text };
+          }
+          return entry;
+        });
+        updateTranscript(updated);
+      }
+    } else if (activeRef.current !== null && isAI) {
+      const activeEntry = activeRef.current;
+      if (activeEntry.text.includes(marker)) {
+        console.log("[WS Live] AI conclusion marker detected in empty-cleaned-chunk fallback check.");
+        markerDetected = true;
+        activeEntry.text = activeEntry.text.replace(marker, '');
+        const updated = transcriptRef.current.map(entry => {
+          if (entry.timestamp === activeEntry.timestamp) {
+            return { ...entry, text: activeEntry.text };
+          }
+          return entry;
+        });
+        updateTranscript(updated);
+      }
+    }
+
+    if (markerDetected) {
+      console.log("[WS Live] AI conclusion marker matched! Waiting for AI closing audio to finish playing...");
+      const checkPlayback = setInterval(() => {
+        const isPlaying = audioPlayerRef.current?.isPlayingOrQueued() || false;
+        if (!isPlaying) {
+          clearInterval(checkPlayback);
+          console.log("AI closing audio finished playing");
+          
+          // Wait an additional short buffer of 4 to 7 seconds (let's use 5 seconds)
+          const bufferDelay = 5000; // 5 seconds
+          console.log(`Waiting for natural pause of ${bufferDelay / 1000} seconds...`);
+          setTimeout(() => {
+            console.log("Natural pause complete, ending interview");
+            handleCompleteInterviewRef.current?.('ai_conclusion');
+          }, bufferDelay);
+        }
+      }, 500);
     }
   };
 
@@ -459,11 +535,34 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
       videoRef.current.srcObject = micStream;
     }
 
+    // 2.5. Create a shared AudioContext and MediaStreamAudioDestinationNode for mixing AI audio + candidate microphone
+    const sharedAudioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+    const recordingDestination = sharedAudioCtx.createMediaStreamDestination();
+
+    // Connect candidate's microphone audio to the recording destination via a GainNode for proper muting support
+    const micSourceNode = sharedAudioCtx.createMediaStreamSource(micStream);
+    const micGainNode = sharedAudioCtx.createGain();
+    micGainNode.gain.value = micMuted ? 0 : 1;
+    micGainNodeRef.current = micGainNode;
+
+    micSourceNode.connect(micGainNode);
+    micGainNode.connect(recordingDestination);
+
     // 3. Start local candidate webcam video recording
     try {
       recordedChunksRef.current = [];
       const options = { mimeType: 'video/webm;codecs=vp8,opus' };
-      const recorder = new MediaRecorder(micStream, options);
+      
+      const recordingStream = new MediaStream();
+      micStream.getVideoTracks().forEach(track => recordingStream.addTrack(track));
+      recordingDestination.stream.getAudioTracks().forEach(track => recordingStream.addTrack(track));
+
+      console.log(`[MediaRecorder] Starting with ${recordingStream.getVideoTracks().length} video track(s) and ${recordingStream.getAudioTracks().length} audio track(s).`);
+      recordingStream.getAudioTracks().forEach((track, idx) => {
+        console.log(`[MediaRecorder] Audio Track ${idx}: label="${track.label}", id="${track.id}", kind="${track.kind}", enabled=${track.enabled}`);
+      });
+
+      const recorder = new MediaRecorder(recordingStream, options);
       recorder.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) {
           recordedChunksRef.current.push(e.data);
@@ -476,7 +575,16 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
       console.error("Local MediaRecorder failed to initialize:", err);
       // Fallback for browsers that don't support vp8,opus codecs
       try {
-        const recorder = new MediaRecorder(micStream);
+        const recordingStream = new MediaStream();
+        micStream.getVideoTracks().forEach(track => recordingStream.addTrack(track));
+        recordingDestination.stream.getAudioTracks().forEach(track => recordingStream.addTrack(track));
+
+        console.log(`[MediaRecorder Fallback] Starting with ${recordingStream.getVideoTracks().length} video track(s) and ${recordingStream.getAudioTracks().length} audio track(s).`);
+        recordingStream.getAudioTracks().forEach((track, idx) => {
+          console.log(`[MediaRecorder Fallback] Audio Track ${idx}: label="${track.label}", id="${track.id}", kind="${track.kind}", enabled=${track.enabled}`);
+        });
+
+        const recorder = new MediaRecorder(recordingStream);
         recorder.ondataavailable = (e) => {
           if (e.data && e.data.size > 0) {
             recordedChunksRef.current.push(e.data);
@@ -490,9 +598,18 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
       }
     }
 
-    // 4. Initialize AI audio queue player
-    audioPlayerRef.current = new AudioQueuePlayer((isPlaying) => {
+    // 4. Initialize AI audio queue player with the shared AudioContext and MediaStreamAudioDestinationNode
+    audioPlayerRef.current = new AudioQueuePlayer(sharedAudioCtx, recordingDestination, (isPlaying) => {
       setIsAiSpeaking(isPlaying);
+      isAiSpeakingRef.current = isPlaying;
+      if (isPlaying) {
+        lastSilenceTriggeredTimeRef.current = 0;
+        lastOverLengthTriggeredTimeRef.current = 0;
+        candidateTurnStartTimeRef.current = 0;
+      } else {
+        lastAiSpokeTimeRef.current = Date.now();
+        lastCandidateActivityTimeRef.current = Date.now();
+      }
     });
 
     // 5. Connect to our secure WebSocket proxy of Gemini Live API
@@ -523,8 +640,32 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
         const existingTranscript = info.transcript || [];
         const isResuming = existingTranscript.length > 0;
 
+        // Calculate recommended question count within 2 to 4 range based on interview length/type
+        let targetQuestions = 3;
+        if (info.duration <= 5) {
+          targetQuestions = 2;
+        } else if (info.duration >= 15) {
+          targetQuestions = 4;
+        } else {
+          targetQuestions = info.interviewType === 'Technical' ? 3 : 4;
+        }
+
+        let cvSection = "";
+        if (info.cvText && info.cvText.trim()) {
+          console.log(`[CV Check] cvText is present. Length: ${info.cvText.length}. First 100 characters: "${info.cvText.slice(0, 100).replace(/\n/g, ' ')}"`);
+          cvSection = `
+CANDIDATE CV/RESUME CONTENT:
+${info.cvText.trim().slice(0, 4000)}
+
+CV-SPECIFIC QUESTION DIRECTIVE:
+You have access to the candidate's actual CV/Resume text above. During the interview, you MUST ask at least one question that references specific, real details from the candidate's actual background, experience, skills, or projects described in their CV. Make this connection feel organic and highly personalized rather than generic.
+`;
+        } else {
+          console.log("[CV Check] cvText is null/empty");
+        }
+
         let systemInstruction = `
-You are InterviewAI, an advanced conversational AI interviewer conducting a structured, highly professional, interactive one-question-at-a-time live interview.
+You are InterviewAI, an advanced, empathetic, and highly professional conversational AI interviewer conducting a structured, interactive, live video interview.
 
 ROLE CONTEXT:
 - Candidate Name: ${info.applicantName}
@@ -533,12 +674,37 @@ ROLE CONTEXT:
 ${info.jobDescription}
 - Interview Style: ${info.interviewType} Interview
 - Target Duration: ${info.duration} minutes
+- Target Question Count: exactly ${targetQuestions} questions (from a strict range of 2 to 4 questions based on duration and interview type)
 
-YOUR DIRECTIVES:
-1. Conduct a structured, welcoming, and high-fidelity interactive interview. Speak naturally, ask ONLY ONE question at a time, wait for the candidate's complete answer, and respond with relevant follow-ups or move onto the next topic.
-2. The candidate will speak to you using voice. Use built-in Voice Activity Detection to listen, pause, and respond naturally. If the candidate interrupts you, pause immediately.
-3. Begin by welcoming ${info.applicantName} to the InterviewAI terminal, state the role they are interviewing for, and ask the first screening or warm-up question.
-4. Naturally conclude the interview by thanking the candidate when a reasonable number of questions (around 4-6) have been asked or when you are notified of time budget completion. Provide a friendly parting remark and let them know the team will review the full dossier.
+CONVERSATIONAL PACE & SPEAKING STYLE:
+- Note: There is no native speed or speaking rate parameter in the Gemini Multimodal Live API. Therefore, you must manage your speaking rate entirely through your style.
+- Speak at a calm, composed, moderately slower pace with natural-sounding pauses.
+- Keep your sentences concise, simple, and conversational.
+
+YOUR INTERVIEW FLOW:
+
+1. OPENING GREETING:
+- Warmly and calmly greet ${info.applicantName} by name.
+- Introduce yourself as InterviewAI.
+- Calmly, clearly, and reassuringly state:
+  a. The role they are interviewing for (${info.jobTitle})
+  b. The interview type (${info.interviewType} Interview)
+  c. The total duration (${info.duration} minutes)
+  d. Reassuring guidance on response length: "Feel free to take a moment to think, and aim to keep answers focused — a couple of minutes per question is plenty."
+- Make sure this opening greeting feels settling, warm, and not rushed. Do NOT ask any questions yet in this first greeting turn. Give the candidate a warm moment to settle and simply invite them to state when they are ready to begin.
+
+2. INTERVIEW STRUCTURE & TONE:
+- Ask exactly ${targetQuestions} questions in total during this interview session.
+- Maintain a warm, highly conversational, and human tone.
+- Avoid a rigid, mechanical "ask → wait → ask" cadence.
+- React briefly and naturally to what the candidate says before transitioning (e.g., "That makes sense," "Interesting approach to that problem," etc.) to demonstrate active listening, rather than jumping straight to the next question.
+${cvSection}
+
+3. CLOSING & TERMINATING THE SESSION:
+- Once you have asked all ${targetQuestions} questions, or if you are informed that the time limit is reached, conclude the interview naturally.
+- Give a warm parting remark, thank the candidate for their time, and let them know the team will review the full dossier.
+- CRITICAL - COMPLETION SIGNAL: After your final spoken parting remarks, you MUST append the exact literal marker [INTERVIEW_COMPLETE] at the very end of your final response text.
+- Do NOT speak the marker [INTERVIEW_COMPLETE] aloud, do not spell it out, do not paraphrase it, and do not describe it. It is a silent, machine-readable signal only.
 `;
 
         if (isResuming) {
@@ -555,6 +721,9 @@ EXISTING TRANSCRIPT:
 ${existingTranscript.map(t => `[${t.sender}]: ${t.text}`).join('\n')}
 `;
         }
+
+        // Diagnosing assembled system instruction text
+        console.log(`[System Instruction] Assembled system instruction:\n${systemInstruction}`);
 
         const setupMessage = {
           setup: {
@@ -685,33 +854,6 @@ ${existingTranscript.map(t => `[${t.sender}]: ${t.text}`).join('\n')}
 
             // Sync the full ordered transcript array to Firestore
             await saveTranscriptToFirestore(transcriptRef.current);
-
-            // Detect AI closing/concluding remarks
-            const lastAiEntry = [...transcriptRef.current].reverse().find(t => t.sender === 'AI');
-            if (lastAiEntry) {
-              const text = lastAiEntry.text.toLowerCase();
-              const hasClosingPhrase = 
-                text.includes("thank you for your time") ||
-                text.includes("thank you very much for your time") ||
-                text.includes("team will review") ||
-                text.includes("review the full dossier") ||
-                text.includes("review your dossier") ||
-                text.includes("review the dossier") ||
-                text.includes("conclude our interview") ||
-                text.includes("concludes our interview") ||
-                text.includes("conclude the interview") ||
-                text.includes("concludes the interview") ||
-                text.includes("wish you the best") ||
-                text.includes("best of luck") ||
-                text.includes("thank you for participating");
-
-              if (hasClosingPhrase) {
-                console.log("[WS Live] AI closing remarks detected in transcript. Triggering interview completion in 4.5 seconds...");
-                setTimeout(() => {
-                  handleCompleteInterviewRef.current?.('ai_conclusion');
-                }, 4500);
-              }
-            }
           }
         }
       } catch (err) {
@@ -730,65 +872,92 @@ ${existingTranscript.map(t => `[${t.sender}]: ${t.text}`).join('\n')}
     };
 
     // 6. Connect microphone output to WebSocket to stream user speech PCM bytes downsampled to 16kHz
-    try {
-      console.log("[WS Live] Initializing microphone AudioContext with sampleRate: 16000 for Gemini Live compatibility...");
-      const micContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      micAudioContextRef.current = micContext;
-      const micSource = micContext.createMediaStreamSource(micStream);
-      const micProcessor = micContext.createScriptProcessor(2048, 1, 1);
-      micProcessorRef.current = micProcessor;
+    const setupMicAudio = async () => {
+      try {
+        console.log("[WS Live] Initializing microphone AudioContext with sampleRate: 16000 for Gemini Live compatibility...");
+        const micContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+        micAudioContextRef.current = micContext;
 
-      micSource.connect(micProcessor);
-      micProcessor.connect(micContext.destination);
+        const workletCode = `
+function uint8ToBase64(uint8Array) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let bytes = uint8Array;
+  let len = bytes.length;
+  let base64 = '';
 
-      micProcessor.onaudioprocess = (e) => {
-        if (micMutedRef.current) return; // Silent if mic muted in UI (using ref to avoid stale closures)
-        if (!isSetupComplete) {
-          console.log("[WS Live] Blocked audio chunk — setup not complete");
+  for (let i = 0; i < len; i += 3) {
+    let b1 = bytes[i];
+    let b2 = i + 1 < len ? bytes[i + 1] : 0;
+    let b3 = i + 2 < len ? bytes[i + 2] : 0;
+
+    let c1 = b1 >> 2;
+    let c2 = ((b1 & 3) << 4) | (b2 >> 4);
+    let c3 = i + 1 < len ? ((b2 & 15) << 2) | (b3 >> 6) : 64;
+    let c4 = i + 2 < len ? b3 & 63 : 64;
+
+    base64 += chars.charAt(c1) + chars.charAt(c2) +
+              (c3 === 64 ? '=' : chars.charAt(c3)) +
+              (c4 === 64 ? '=' : chars.charAt(c4));
+  }
+  return base64;
+}
+
+class MicProcessor extends AudioWorkletProcessor {
+  process(inputs, outputs, parameters) {
+    const input = inputs[0];
+    if (!input || !input[0] || input[0].length === 0) {
+      return true;
+    }
+    const float32Array = input[0];
+    
+    // Convert to PCM Int16
+    const int16Array = new Int16Array(float32Array.length);
+    for (let i = 0; i < float32Array.length; i++) {
+      const s = Math.max(-1, Math.min(1, float32Array[i]));
+      int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    
+    const uint8View = new Uint8Array(int16Array.buffer);
+    const base64Data = uint8ToBase64(uint8View);
+    
+    this.port.postMessage({ base64: base64Data });
+    
+    return true;
+  }
+}
+
+registerProcessor('mic-processor', MicProcessor);
+`;
+
+        const blob = new Blob([workletCode], { type: 'application/javascript' });
+        const workletUrl = URL.createObjectURL(blob);
+        await micContext.audioWorklet.addModule(workletUrl);
+        URL.revokeObjectURL(workletUrl);
+
+        if (isAborted) {
+          micContext.close();
           return;
         }
 
-        const float32MicData = e.inputBuffer.getChannelData(0);
-        const pcmInt16 = float32ToInt16(float32MicData);
-        const base64Data = arrayBufferToBase64(pcmInt16.buffer);
-
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({
-            realtimeInput: {
-              audio: {
-                data: base64Data,
-                mimeType: "audio/pcm;rate=16000"
-              }
-            }
-          }));
-
-          micChunkCountRef.current++;
-          if (micChunkCountRef.current % 50 === 0) {
-            console.log(`[WS Live] Throttled Mic Audio Sent: stream active. Sent ${micChunkCountRef.current} chunks total.`);
-          }
-        }
-      };
-    } catch (audioErr) {
-      console.error("[WS Live] Failed to initialize AudioContext with 16000Hz, falling back to default sample rate...", audioErr);
-      try {
-        const micContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-        micAudioContextRef.current = micContext;
         const micSource = micContext.createMediaStreamSource(micStream);
-        const micProcessor = micContext.createScriptProcessor(2048, 1, 1);
-        micProcessorRef.current = micProcessor;
+        const micNode = new AudioWorkletNode(micContext, 'mic-processor');
+        micWorkletNodeRef.current = micNode;
 
-        micSource.connect(micProcessor);
-        micProcessor.connect(micContext.destination);
+        micSource.connect(micNode);
 
-        micProcessor.onaudioprocess = (e) => {
+        const silentGainNode = micContext.createGain();
+        silentGainNode.gain.value = 0;
+        micNode.connect(silentGainNode);
+        silentGainNode.connect(micContext.destination);
+
+        micNode.port.onmessage = (e) => {
           if (micMutedRef.current) return;
           if (!isSetupComplete) {
             console.log("[WS Live] Blocked audio chunk — setup not complete");
             return;
           }
-          const float32MicData = e.inputBuffer.getChannelData(0);
-          const pcmInt16 = float32ToInt16(float32MicData);
-          const base64Data = arrayBufferToBase64(pcmInt16.buffer);
+
+          const base64Data = e.data.base64;
 
           if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             wsRef.current.send(JSON.stringify({
@@ -801,12 +970,53 @@ ${existingTranscript.map(t => `[${t.sender}]: ${t.text}`).join('\n')}
             }));
 
             micChunkCountRef.current++;
+            if (micChunkCountRef.current % 50 === 0) {
+              console.log(`[WS Live] Throttled Mic Audio Sent: stream active. Sent ${micChunkCountRef.current} chunks total.`);
+            }
           }
         };
-      } catch (innerAudioErr) {
-        console.error("[WS Live] Safe AudioContext fallback initialization failed:", innerAudioErr);
+      } catch (audioErr) {
+        console.error("[WS Live] AudioWorklet initialization failed, falling back to ScriptProcessorNode...", audioErr);
+        try {
+          const micContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+          micAudioContextRef.current = micContext;
+          const micSource = micContext.createMediaStreamSource(micStream);
+          const micProcessor = micContext.createScriptProcessor(2048, 1, 1);
+          micProcessorRef.current = micProcessor;
+
+          micSource.connect(micProcessor);
+          micProcessor.connect(micContext.destination);
+
+          micProcessor.onaudioprocess = (e) => {
+            if (micMutedRef.current) return;
+            if (!isSetupComplete) {
+              console.log("[WS Live] Blocked audio chunk — setup not complete");
+              return;
+            }
+            const float32MicData = e.inputBuffer.getChannelData(0);
+            const pcmInt16 = float32ToInt16(float32MicData);
+            const base64Data = arrayBufferToBase64(pcmInt16.buffer);
+
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({
+                realtimeInput: {
+                  audio: {
+                    data: base64Data,
+                    mimeType: "audio/pcm;rate=16000"
+                  }
+                }
+              }));
+
+              micChunkCountRef.current++;
+            }
+          };
+        } catch (innerAudioErr) {
+          console.error("[WS Live] Safe AudioContext fallback initialization failed:", innerAudioErr);
+        }
       }
-    }
+    };
+
+    setupMicAudio();
 
     return () => {
       // Cleanups
@@ -819,9 +1029,82 @@ ${existingTranscript.map(t => `[${t.sender}]: ${t.text}`).join('\n')}
       try { socket.close(); } catch (e) {}
       try { audioPlayerRef.current?.clear(); } catch (e) {}
       try { micProcessorRef.current?.disconnect(); } catch (e) {}
+      try { micWorkletNodeRef.current?.disconnect(); } catch (e) {}
       try { micAudioContextRef.current?.close(); } catch (e) {}
+      try { sharedAudioCtx.close(); } catch (e) {}
     };
   }, [interviewId, micStream]);
+
+  // Silence and Over-Length checking loop
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (isSubmittingRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      const now = Date.now();
+
+      // SILENCE HANDLING
+      if (!isAiSpeakingRef.current) {
+        const timeSinceAiSpoke = now - lastAiSpokeTimeRef.current;
+        const timeSinceCandidateActivity = now - lastCandidateActivityTimeRef.current;
+
+        if (timeSinceAiSpoke > 22000 && timeSinceCandidateActivity > 22000 && lastSilenceTriggeredTimeRef.current === 0) {
+          lastSilenceTriggeredTimeRef.current = now;
+          console.log("Silence threshold reached — prompting re-engagement");
+          
+          const nudgeMessage = {
+            clientContent: {
+              turns: [
+                {
+                  role: "user",
+                  parts: [
+                    {
+                      text: "[SYSTEM NOTE: The candidate has been silent for more than 20 seconds. Gently re-engage them by checking in, e.g., 'Take your time — would you like me to repeat the question?' or similar. Keep it warm, polite, and brief.]"
+                    }
+                  ]
+                }
+              ],
+              turnComplete: true
+            }
+          };
+          wsRef.current.send(JSON.stringify(nudgeMessage));
+        }
+      }
+
+      // OVER-LENGTH HANDLING
+      if (candidateTurnStartTimeRef.current > 0 && !isAiSpeakingRef.current) {
+        const timeSpentSpeaking = now - candidateTurnStartTimeRef.current;
+        const durationMin = interview?.duration || 10;
+        const overLengthThresholdMs = (durationMin * 60 * 0.2) * 1000;
+        const thresholdMs = Math.max(45000, overLengthThresholdMs);
+
+        if (timeSpentSpeaking > thresholdMs && lastOverLengthTriggeredTimeRef.current === 0) {
+          lastOverLengthTriggeredTimeRef.current = now;
+          console.log("Over-length response detected — prompting wrap-up");
+
+          const overLengthMessage = {
+            clientContent: {
+              turns: [
+                {
+                  role: "user",
+                  parts: [
+                    {
+                      text: "[SYSTEM NOTE: The candidate has been speaking continuously for an unusually long time (consuming a significant portion of the total interview budget). Please politely and naturally interject or gently nudge them to wrap up their answer so you can move to the next question, e.g., 'Thank you, that is a great overview — to make sure we cover everything, let's move on to...' or similar. Keep it professional, gentle, and smooth.]"
+                    }
+                  ]
+                }
+              ],
+              turnComplete: true
+            }
+          };
+          wsRef.current.send(JSON.stringify(overLengthMessage));
+        }
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [interview]);
 
   // Timer Countdown loop
   useEffect(() => {

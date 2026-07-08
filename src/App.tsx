@@ -302,13 +302,17 @@ export default function App() {
                 key={listRefreshKey}
                 onSelectInterview={(selected) => setSelectedInterview(selected)}
                 selectedInterviewId={selectedInterview?.id}
+                onDeleteSuccess={() => setSelectedInterview(null)}
               />
             </div>
 
             {/* Right column: Selected candidate detailed assessment dossier report */}
             <div className="lg:col-span-7">
               {selectedInterview ? (
-                <InterviewDetail interviewId={selectedInterview.id} />
+                <InterviewDetail 
+                  interviewId={selectedInterview.id} 
+                  onDeleteSuccess={() => setSelectedInterview(null)}
+                />
               ) : (
                 <div className="bg-white rounded-xl border border-slate-200 p-12 shadow-sm text-center min-h-[400px] flex flex-col justify-center items-center space-y-4">
                   <div className="h-16 w-16 bg-indigo-50 rounded-2xl flex items-center justify-center text-indigo-500">

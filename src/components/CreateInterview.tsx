@@ -13,6 +13,7 @@ export default function CreateInterview({ onInterviewCreated }: CreateInterviewP
   const [jobDescription, setJobDescription] = useState('');
   const [interviewType, setInterviewType] = useState<'Technical' | 'Behavioral' | 'Screening'>('Technical');
   const [duration, setDuration] = useState<number>(10);
+  const [cvFile, setCvFile] = useState<File | null>(null);
   
   const [loading, setLoading] = useState(false);
   const [createdLink, setCreatedLink] = useState<string | null>(null);
@@ -24,21 +25,33 @@ export default function CreateInterview({ onInterviewCreated }: CreateInterviewP
     setCreatedLink(null);
 
     try {
-      // 1. Create initial pending record
-      const docRef = await addDoc(collection(db, 'interviews'), {
-        applicantName,
-        jobTitle,
-        jobDescription,
-        interviewType,
-        duration,
-        status: 'pending',
-        createdAt: new Date().toISOString(),
-        transcript: []
+      const formData = new FormData();
+      formData.append('applicantName', applicantName);
+      formData.append('jobTitle', jobTitle);
+      formData.append('jobDescription', jobDescription);
+      formData.append('interviewType', interviewType);
+      formData.append('duration', String(duration));
+      if (cvFile) {
+        formData.append('cv', cvFile);
+      }
+
+      console.log('[CreateInterview] Sending creation request to server...');
+      const res = await fetch('/api/interviews', {
+        method: 'POST',
+        body: formData,
       });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({ error: 'Unknown server error' }));
+        throw new Error(errData.error || 'Failed to create interview');
+      }
+
+      const data = await res.json();
+      const interviewId = data.interviewId;
 
       // 2. Generate sharing link
       const origin = window.location.origin;
-      const shareLink = `${origin}/interview/${docRef.id}`;
+      const shareLink = `${origin}/interview/${interviewId}`;
       setCreatedLink(shareLink);
 
       // Reset form fields
@@ -47,12 +60,13 @@ export default function CreateInterview({ onInterviewCreated }: CreateInterviewP
       setJobDescription('');
       setInterviewType('Technical');
       setDuration(10);
+      setCvFile(null);
 
       // Trigger list update
       onInterviewCreated();
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error creating interview:', err);
-      alert('Failed to create interview. Please try again.');
+      alert(err.message || 'Failed to create interview. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -166,6 +180,79 @@ export default function CreateInterview({ onInterviewCreated }: CreateInterviewP
                 className="w-full rounded-lg border border-slate-200 pl-10 pr-4 py-2.5 text-sm text-slate-900 focus:border-indigo-600 focus:outline-none focus:ring-1 focus:ring-indigo-600 transition-colors bg-[#F8FAFC]/50"
               />
             </div>
+          </div>
+        </div>
+
+        <div>
+          <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-1.5">
+            Candidate CV/Resume (optional)
+          </label>
+          <div 
+            className={`border-2 border-dashed rounded-lg p-5 text-center cursor-pointer transition-colors ${
+              cvFile 
+                ? 'border-indigo-500 bg-indigo-50/20' 
+                : 'border-slate-200 hover:border-indigo-300 hover:bg-slate-50/50'
+            }`}
+            onDragOver={(e) => {
+              e.preventDefault();
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              const file = e.dataTransfer.files?.[0];
+              if (file) {
+                const ext = file.name.split('.').pop()?.toLowerCase();
+                if (ext === 'pdf' || ext === 'docx') {
+                  setCvFile(file);
+                } else {
+                  alert('Only .pdf and .docx files are accepted.');
+                }
+              }
+            }}
+            onClick={() => {
+              const fileInput = document.getElementById('cv-file-input');
+              if (fileInput) fileInput.click();
+            }}
+          >
+            <input 
+              id="cv-file-input"
+              type="file"
+              accept=".pdf,.docx"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0] || null;
+                if (file) {
+                  const ext = file.name.split('.').pop()?.toLowerCase();
+                  if (ext === 'pdf' || ext === 'docx') {
+                    setCvFile(file);
+                  } else {
+                    alert('Only .pdf and .docx files are accepted.');
+                  }
+                }
+              }}
+            />
+            {cvFile ? (
+              <div className="flex items-center justify-center gap-2.5 text-indigo-700 font-medium text-sm">
+                <FileText className="h-5 w-5 shrink-0 text-indigo-500" />
+                <span className="truncate max-w-[200px] sm:max-w-xs">{cvFile.name}</span>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setCvFile(null);
+                    const fileInput = document.getElementById('cv-file-input') as HTMLInputElement;
+                    if (fileInput) fileInput.value = '';
+                  }}
+                  className="ml-2 text-xs bg-indigo-100 hover:bg-indigo-200 text-indigo-700 px-2 py-1 rounded-md transition-colors"
+                >
+                  Remove
+                </button>
+              </div>
+            ) : (
+              <div className="text-slate-500 text-xs">
+                <p className="font-semibold">Drag & drop candidate CV/Resume here, or <span className="text-indigo-600 hover:underline">browse</span></p>
+                <p className="text-slate-400 mt-1">Accepts only .pdf and .docx files (max 10MB)</p>
+              </div>
+            )}
           </div>
         </div>
 

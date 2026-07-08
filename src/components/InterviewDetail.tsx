@@ -2,16 +2,19 @@ import { useState, useEffect } from 'react';
 import { db } from '../firebase';
 import { doc, onSnapshot } from 'firebase/firestore';
 import { Interview } from '../types';
-import { Award, CheckCircle, XCircle, FileText, Video, ThumbsUp, ThumbsDown, MessageSquare, Briefcase, HelpCircle, AlertTriangle } from 'lucide-react';
+import { Award, CheckCircle, XCircle, FileText, Video, ThumbsUp, ThumbsDown, MessageSquare, Briefcase, HelpCircle, AlertTriangle, Trash2 } from 'lucide-react';
 
 interface InterviewDetailProps {
   interviewId: string;
+  onDeleteSuccess?: () => void;
 }
 
-export default function InterviewDetail({ interviewId }: InterviewDetailProps) {
+export default function InterviewDetail({ interviewId, onDeleteSuccess }: InterviewDetailProps) {
   const [interview, setInterview] = useState<Interview | null>(null);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<'report' | 'transcript'>('report');
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   useEffect(() => {
     // Set up a real-time listener for the specific interview document to receive automatic updates
@@ -80,6 +83,18 @@ export default function InterviewDetail({ interviewId }: InterviewDetailProps) {
           <p className="text-slate-500 font-medium mt-1">
             Role: <span className="text-slate-800 font-semibold">{interview.jobTitle}</span> • Session duration: {interview.duration} mins
           </p>
+          {interview.cvFileUrl && (
+            <div className="mt-2.5">
+              <a
+                href={interview.cvFileUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 text-xs font-bold text-indigo-600 hover:text-indigo-800 bg-indigo-50/70 hover:bg-indigo-100 px-3 py-1.5 rounded-lg transition-colors border border-indigo-100"
+              >
+                <FileText className="h-3.5 w-3.5 text-indigo-500" /> View CV / Resume
+              </a>
+            </div>
+          )}
         </div>
         <div className="text-left sm:text-right shrink-0">
           {!isCompleted ? (
@@ -88,22 +103,17 @@ export default function InterviewDetail({ interviewId }: InterviewDetailProps) {
                 <span className="h-2 w-2 rounded-full bg-amber-500 animate-pulse mr-2 inline-block" />
                 {isInProgress ? 'In Session' : isProcessing ? 'Processing Evaluation' : 'Awaiting Live Connect'}
               </div>
-              {!isProcessing && (
-                <button
-                  onClick={() => {
-                    window.history.pushState({}, '', `/interview/${interview.id}`);
-                    window.dispatchEvent(new Event('popstate'));
-                  }}
-                  className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-lg shadow-xs transition-colors cursor-pointer whitespace-nowrap"
-                >
-                  <Video className="h-3.5 w-3.5" /> Test / Preview Interview
-                </button>
-              )}
+              <button
+                onClick={() => setShowDeleteModal(true)}
+                className="inline-flex items-center gap-2 px-4 py-2 border border-rose-200 hover:bg-rose-50 text-rose-700 font-bold text-xs rounded-lg transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <Trash2 className="h-3.5 w-3.5" /> Delete Interview
+              </button>
             </div>
           ) : (
-            <div className="flex flex-col items-start sm:items-end gap-2">
+            <div className="flex flex-col items-start sm:items-end gap-3">
               {interview.recordingStatus === 'uploading' && (
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-1 text-[10px] font-bold text-amber-700 border border-amber-200 animate-pulse mb-1">
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-1 text-[10px] font-bold text-amber-700 border border-amber-200 animate-pulse">
                   <svg className="animate-spin h-3 w-3 text-amber-600" fill="none" viewBox="0 0 24 24">
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
@@ -120,6 +130,12 @@ export default function InterviewDetail({ interviewId }: InterviewDetailProps) {
                   No-Hire / Reject
                 </div>
               )}
+              <button
+                onClick={() => setShowDeleteModal(true)}
+                className="inline-flex items-center gap-2 px-4 py-2 border border-rose-200 hover:bg-rose-50 text-rose-700 font-bold text-xs rounded-lg transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <Trash2 className="h-3.5 w-3.5" /> Delete Interview
+              </button>
             </div>
           )}
           {isCompleted && (
@@ -226,22 +242,13 @@ export default function InterviewDetail({ interviewId }: InterviewDetailProps) {
               </h3>
               {interview.recordingUrl ? (
                 <div className="space-y-3">
-                  {interview.recordingStatus === 'local_only' && (
-                    <div className="flex items-start gap-3 p-4 bg-amber-50/70 border border-amber-200 text-amber-900 rounded-xl text-xs">
-                      <AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
-                      <div>
-                        <p className="font-bold">Recording stored temporarily — may not persist</p>
-                        <p className="text-amber-700 mt-1 leading-normal">
-                          The real Firebase Storage cloud upload was not enabled or failed. This video is stored temporarily on this server's ephemeral container disk. It will be wiped permanently on the next container redeployment or restart.
-                        </p>
-                      </div>
-                    </div>
-                  )}
                   <div className="aspect-video w-full bg-slate-900 rounded-xl overflow-hidden shadow-sm border border-slate-200">
-                    <video 
+                    <iframe 
                       src={interview.recordingUrl} 
-                      controls 
-                      className="w-full h-full object-contain"
+                      className="w-full h-full border-0"
+                      allow="autoplay; encrypted-media"
+                      allowFullScreen
+                      title="Candidate Session Recording"
                     />
                   </div>
                 </div>
@@ -314,6 +321,69 @@ export default function InterviewDetail({ interviewId }: InterviewDetailProps) {
                   No dialog segments recorded yet.
                 </div>
               )}
+            </div>
+          </div>
+        )}
+
+        {showDeleteModal && (
+          <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-xl shadow-lg border border-slate-200 p-6 max-w-md w-full animate-in fade-in zoom-in duration-150 text-left">
+              <div className="flex items-start gap-4">
+                <div className="h-10 w-10 rounded-full bg-rose-50 text-rose-600 flex items-center justify-center shrink-0">
+                  <AlertTriangle className="h-5 w-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">Delete this interview?</h3>
+                  <p className="text-xs text-slate-500 mt-2 leading-relaxed">
+                    This will permanently remove the interview, its transcript, and its recording. This cannot be undone.
+                  </p>
+                </div>
+              </div>
+              <div className="flex justify-end gap-3 mt-6">
+                <button
+                  disabled={isDeleting}
+                  onClick={() => setShowDeleteModal(false)}
+                  className="px-4 py-2 text-xs font-semibold border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-700 cursor-pointer transition-colors disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  disabled={isDeleting}
+                  onClick={async () => {
+                    setIsDeleting(true);
+                    try {
+                      const res = await fetch(`/api/interviews/${interview.id}`, {
+                        method: 'DELETE',
+                      });
+                      if (!res.ok) {
+                        throw new Error('Failed to delete interview');
+                      }
+                      setShowDeleteModal(false);
+                      if (onDeleteSuccess) {
+                        onDeleteSuccess();
+                      }
+                    } catch (err) {
+                      console.error('Error deleting interview:', err);
+                      alert('Failed to delete interview. Please try again.');
+                    } finally {
+                      setIsDeleting(false);
+                    }
+                  }}
+                  className="px-4 py-2 text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white rounded-lg cursor-pointer transition-colors flex items-center gap-1.5 disabled:opacity-50"
+                >
+                  {isDeleting ? (
+                    <>
+                      <svg className="animate-spin -ml-0.5 mr-1.5 h-3.5 w-3.5 text-white" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                      </svg>
+                      Deleting...
+                    </>
+                  ) : (
+                    'Delete'
+                  )}
+                </button>
+              </div>
             </div>
           </div>
         )}

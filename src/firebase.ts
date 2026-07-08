@@ -1,6 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
-import { getFirestore } from 'firebase/firestore';
+import { initializeFirestore } from 'firebase/firestore';
 import { getStorage } from 'firebase/storage';
 
 // Firebase configuration from firebase-applet-config.json
@@ -19,8 +19,8 @@ export const auth = getAuth(app);
 
 // Use custom Firestore Database ID if present
 const databaseId = "ai-studio-interviewai-8c2a3b00-8d1c-4052-9862-9c10f4636ec7";
-export const db = databaseId 
-  ? getFirestore(app, databaseId)
-  : getFirestore(app);
+export const db = initializeFirestore(app, {
+  experimentalForceLongPolling: true,
+}, databaseId || undefined);
 
 export const storage = getStorage(app);
