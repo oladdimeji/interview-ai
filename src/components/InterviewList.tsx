@@ -49,14 +49,14 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
     switch (status) {
       case 'completed':
         return (
-          <span className="inline-flex items-center gap-1.5 rounded-full bg-green-50 px-2.5 py-1 text-xs font-semibold text-green-700 border border-green-200">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-accent/10 px-2.5 py-1 text-xs font-semibold text-emerald-accent border border-emerald-accent/25">
             <CheckCircle2 className="h-3 w-3" /> Completed
           </span>
         );
       case 'processing':
         return (
-          <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-700 border border-amber-200 animate-pulse">
-            <svg className="animate-spin h-3 w-3 text-amber-600" fill="none" viewBox="0 0 24 24">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-accent/10 px-2.5 py-1 text-xs font-semibold text-amber-accent border border-amber-accent/25 animate-pulse">
+            <svg className="animate-spin h-3 w-3 text-amber-accent" fill="none" viewBox="0 0 24 24">
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
             </svg>
@@ -65,13 +65,13 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
         );
       case 'in_progress':
         return (
-          <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-50 px-2.5 py-1 text-xs font-semibold text-blue-700 border border-blue-200 animate-pulse">
-            <Video className="h-3 w-3" /> In Progress
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-slate px-2.5 py-1 text-xs font-semibold text-neutral-bg border border-graphite animate-pulse">
+            <Video className="h-3 w-3 text-emerald-accent" /> In Progress
           </span>
         );
       default:
         return (
-          <span className="inline-flex items-center gap-1.5 rounded-full bg-gray-100 px-2.5 py-1 text-xs font-semibold text-gray-700 border border-gray-200">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-neutral-bg px-2.5 py-1 text-xs font-semibold text-ink/60 border border-neutral-200">
             <Hourglass className="h-3 w-3" /> Pending
           </span>
         );
@@ -88,23 +88,24 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
   };
 
   return (
-    <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm" id="interview-list-view">
+    <div className="bg-white rounded-xl border border-neutral-200 p-6 shadow-sm" id="interview-list-view">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
         <div className="flex items-center gap-2">
-          <ListFilter className="h-5 w-5 text-slate-500" />
-          <h2 className="font-display text-lg font-bold text-slate-900">Interviews Directory</h2>
+          <div>
+            <h2 className="font-display text-lg sm:text-xl font-extrabold tracking-tight text-ink leading-none">Interviews</h2>
+          </div>
         </div>
         
         {/* Status filters */}
-        <div className="flex rounded-lg bg-[#F8FAFC] border border-slate-200 p-1 text-xs">
+        <div className="flex rounded-lg bg-neutral-bg border border-neutral-200 p-1 text-[10px] font-mono">
           {(['all', 'pending', 'in_progress', 'completed'] as const).map((opt) => (
             <button
               key={opt}
               onClick={() => setFilter(opt)}
-              className={`rounded px-3 py-1.5 font-semibold transition-colors cursor-pointer capitalize ${
+              className={`rounded px-2.5 py-1.5 font-bold transition-all duration-200 cursor-pointer capitalize ${
                 filter === opt 
-                  ? 'bg-indigo-600 text-white shadow-sm' 
-                  : 'text-slate-500 hover:text-slate-950'
+                  ? 'bg-emerald-accent text-ink shadow-sm' 
+                  : 'text-ink/60 hover:text-ink hover:bg-neutral-bg/40'
               }`}
             >
               {opt === 'in_progress' ? 'Active' : opt}
@@ -115,40 +116,40 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
 
       {loading ? (
         <div className="flex justify-center items-center py-12">
-          <div className="h-8 w-8 animate-spin rounded-full border-2 border-indigo-600 border-t-transparent" />
+          <div className="h-8 w-8 animate-spin rounded-full border-2 border-emerald-accent border-t-transparent" />
         </div>
       ) : filteredInterviews.length === 0 ? (
-        <div className="text-center py-12 border border-dashed border-slate-200 rounded-xl">
-          <p className="text-sm text-slate-500">No interviews found for the selected filter.</p>
+        <div className="text-center py-12 border border-dashed border-neutral-200 rounded-xl">
+          <p className="text-sm text-ink/40 font-mono">No interviews found for the selected filter.</p>
         </div>
       ) : (
-        <div className="divide-y divide-slate-100">
+        <div className="divide-y divide-neutral-100">
           {filteredInterviews.map((interview) => {
             const isSelected = selectedInterviewId === interview.id;
             return (
               <div
                 key={interview.id}
                 onClick={() => onSelectInterview(interview)}
-                className={`flex items-center justify-between py-4 px-3 -mx-3 rounded-lg transition-all cursor-pointer ${
+                className={`flex items-center justify-between py-4 px-3 -mx-3 rounded-lg transition-all duration-200 cursor-pointer ${
                   isSelected 
-                    ? 'bg-indigo-50/40 border border-indigo-100 border-l-4 border-l-indigo-600 pl-4 shadow-sm' 
-                    : 'hover:bg-[#F8FAFC]'
+                    ? 'bg-emerald-accent/5 border border-emerald-accent/15 border-l-4 border-l-emerald-accent pl-4 shadow-sm' 
+                    : 'hover:bg-neutral-bg/30'
                 }`}
               >
                 <div className="flex items-center gap-4 min-w-0">
-                  <div className="h-10 w-10 shrink-0 rounded-full bg-indigo-50 text-indigo-700 flex items-center justify-center font-display font-semibold text-sm">
+                  <div className="h-10 w-10 shrink-0 rounded-full bg-slate text-neutral-bg border border-graphite flex items-center justify-center font-display font-bold text-sm">
                     {getInitials(interview.applicantName)}
                   </div>
                   <div className="min-w-0">
-                    <p className="text-sm font-semibold text-slate-900 truncate">
+                    <p className="text-sm font-semibold text-ink truncate">
                       {interview.applicantName}
                     </p>
-                    <p className="text-xs text-slate-500 truncate mt-0.5">
-                      {interview.jobTitle} • <span className="font-semibold text-slate-700">{interview.interviewType}</span>
+                    <p className="text-xs text-ink/60 truncate mt-0.5 font-sans">
+                      {interview.jobTitle} • <span className="font-semibold text-ink/80 font-mono text-[10px] uppercase tracking-wide">{interview.interviewType}</span>
                     </p>
                     <div className="flex items-center gap-2 mt-1.5">
-                      <span className="inline-flex items-center gap-1 text-[10px] text-slate-400 font-semibold uppercase tracking-wider">
-                        <Calendar className="h-3 w-3" />
+                      <span className="inline-flex items-center gap-1 text-[10px] text-ink/40 font-semibold font-mono uppercase tracking-wider">
+                        <Calendar className="h-3 w-3 text-emerald-accent" />
                         {new Date(interview.createdAt).toLocaleDateString()}
                       </span>
                     </div>
@@ -163,11 +164,11 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
                       setDeletingId(interview.id);
                     }}
                     title="Delete Interview"
-                    className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
+                    className="p-1.5 text-ink/40 hover:text-amber-accent hover:bg-amber-accent/5 rounded-lg transition-colors cursor-pointer"
                   >
                     <Trash2 className="h-4 w-4" />
                   </button>
-                  <ChevronRight className={`h-5 w-5 text-slate-400 transition-transform ${isSelected ? 'translate-x-1 text-indigo-600' : ''}`} />
+                  <ChevronRight className={`h-5 w-5 text-ink/30 transition-transform ${isSelected ? 'translate-x-1 text-emerald-accent' : ''}`} />
                 </div>
               </div>
             );
@@ -176,24 +177,24 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
       )}
 
       {deletingId && (
-        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-xl shadow-lg border border-slate-200 p-6 max-w-md w-full animate-in fade-in zoom-in duration-150">
+        <div className="fixed inset-0 bg-ink/80 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in">
+          <div className="bg-white rounded-xl shadow-2xl border border-neutral-200 p-6 max-w-md w-full animate-in fade-in zoom-in-95 duration-200">
             <div className="flex items-start gap-4">
-              <div className="h-10 w-10 rounded-full bg-rose-50 text-rose-600 flex items-center justify-center shrink-0">
+              <div className="h-10 w-10 rounded-full bg-amber-accent/10 text-amber-accent flex items-center justify-center shrink-0">
                 <AlertTriangle className="h-5 w-5" />
               </div>
               <div>
-                <h3 className="text-base font-bold text-slate-900">Delete this interview?</h3>
-                <p className="text-xs text-slate-500 mt-2 leading-relaxed">
-                  This will permanently remove the interview, its transcript, and its recording. This cannot be undone.
+                <h3 className="text-base font-bold text-ink">Delete this interview?</h3>
+                <p className="text-xs text-ink/60 mt-2 leading-relaxed">
+                  This will permanently remove the interview, its transcript, and its recording. This action cannot be undone.
                 </p>
               </div>
             </div>
-            <div className="flex justify-end gap-3 mt-6">
+            <div className="flex justify-end gap-3 mt-6 font-mono text-xs">
               <button
                 disabled={isDeleting}
                 onClick={() => setDeletingId(null)}
-                className="px-4 py-2 text-xs font-semibold border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-700 cursor-pointer transition-colors disabled:opacity-50"
+                className="px-4 py-2 font-bold border border-neutral-200 rounded-lg hover:bg-neutral-bg text-ink cursor-pointer transition-colors disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -219,7 +220,7 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
                     setDeletingId(null);
                   }
                 }}
-                className="px-4 py-2 text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white rounded-lg cursor-pointer transition-colors flex items-center gap-1.5 disabled:opacity-50"
+                className="px-4 py-2 font-bold bg-ink hover:opacity-90 text-white rounded-lg cursor-pointer transition-colors flex items-center gap-1.5 disabled:opacity-50"
               >
                 {isDeleting ? (
                   <>

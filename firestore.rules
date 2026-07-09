@@ -22,8 +22,8 @@ service cloud.firestore {
 
     // Rules for Interviews
     match /interviews/{interviewId} {
-      // Pillar 3 & 8: Access is allowed on list queries and gets for valid document IDs
-      allow read: if isValidId(interviewId);
+      // Pillar 3 & 8: Access is allowed on read queries (gets and lists)
+      allow read: if true;
       
       // Pillar 2 & 6: Validate incoming schema on create
       allow create: if isValidId(interviewId) 

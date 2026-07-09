@@ -17,6 +17,7 @@ export default function App() {
   const [route, setRoute] = useState<{ path: 'admin' | 'candidate'; interviewId?: string }>({ path: 'admin' });
   
   // Admin dashboard state
+  const [adminView, setAdminView] = useState<'dashboard' | 'create'>('dashboard');
   const [selectedInterview, setSelectedInterview] = useState<Interview | null>(null);
   const [listRefreshKey, setListRefreshKey] = useState(0);
 
@@ -200,59 +201,61 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen lg:h-screen w-full bg-[#F8FAFC] flex flex-col lg:flex-row font-sans text-slate-900 overflow-hidden">
+    <div className="min-h-screen lg:h-screen w-full bg-neutral-bg flex flex-col lg:flex-row font-sans text-ink overflow-hidden">
       {/* Sidebar Navigation */}
-      <aside className="w-full lg:w-64 bg-slate-900 text-white flex flex-col shrink-0 border-b border-slate-800 lg:border-none">
-        <div className="p-6 flex items-center space-x-2">
-          <div className="w-8 h-8 bg-indigo-500 rounded-lg flex items-center justify-center text-white">
+      <aside className="w-full lg:w-64 bg-ink text-neutral-bg flex flex-col shrink-0 border-b border-graphite lg:border-none shadow-xl z-10">
+        <div className="p-6 flex items-center space-x-3 border-b border-graphite">
+          <div className="w-9 h-9 bg-emerald-accent rounded-lg flex items-center justify-center text-ink shadow-[0_0_12px_rgba(16,185,129,0.3)]">
             <span className="text-xl font-bold font-display">I</span>
           </div>
-          <h1 className="text-xl font-bold tracking-tight font-display">InterviewAI</h1>
+          <div>
+            <h1 className="text-lg font-bold tracking-tight font-display text-white">InterviewAI</h1>
+          </div>
         </div>
 
-        <nav className="flex-1 px-4 space-y-1 mt-4">
-          <div className="p-3 text-slate-400 text-xs font-semibold uppercase tracking-wider">Admin Panel</div>
+        <nav className="flex-1 px-4 space-y-1.5 mt-6">
           <button
-            onClick={() => setSelectedInterview(null)}
-            className={`w-full flex items-center space-x-3 p-3 rounded-lg transition-colors cursor-pointer text-left ${
-              !selectedInterview 
-                ? 'bg-indigo-600 text-white font-medium' 
-                : 'text-slate-300 hover:bg-slate-800'
+            onClick={() => {
+              setAdminView('dashboard');
+              setSelectedInterview(null);
+            }}
+            className={`w-full flex items-center space-x-3 p-3 rounded-lg transition-all duration-200 cursor-pointer text-left ${
+              adminView === 'dashboard' && !selectedInterview
+                ? 'bg-emerald-accent text-ink font-semibold shadow-lg shadow-emerald-accent/20' 
+                : 'text-neutral-bg/70 hover:bg-slate/50 hover:text-white'
             }`}
           >
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16" />
             </svg>
-            <span>Dashboard</span>
+            <span className="text-sm">Dashboard</span>
           </button>
           
           <button
             onClick={() => {
               setSelectedInterview(null);
-              setTimeout(() => {
-                const element = document.getElementById('create-interview-view');
-                if (element) {
-                  element.scrollIntoView({ behavior: 'smooth' });
-                }
-              }, 100);
+              setAdminView('create');
             }}
-            className="w-full flex items-center space-x-3 p-3 rounded-lg text-slate-300 hover:bg-slate-800 transition-colors cursor-pointer text-left"
+            className={`w-full flex items-center space-x-3 p-3 rounded-lg transition-all duration-200 cursor-pointer text-left ${
+              adminView === 'create'
+                ? 'bg-emerald-accent text-ink font-semibold shadow-lg shadow-emerald-accent/20' 
+                : 'text-neutral-bg/70 hover:bg-slate/50 hover:text-white'
+            }`}
           >
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
             </svg>
-            <span>Create New</span>
+            <span className="text-sm">Create New</span>
           </button>
         </nav>
 
-        <div className="p-6 border-t border-slate-800">
+        <div className="p-6 border-t border-graphite bg-slate/30">
           <div className="flex items-center space-x-3 min-w-0">
-            <div className="w-10 h-10 rounded-full bg-slate-700 shrink-0 flex items-center justify-center text-white font-bold uppercase font-display text-xs">
+            <div className="w-9 h-9 rounded-full bg-slate border border-graphite shrink-0 flex items-center justify-center text-white font-bold uppercase font-display text-xs">
               AD
             </div>
             <div className="min-w-0">
-              <div className="text-sm font-semibold truncate text-white">Administrator</div>
-              <div className="text-[10px] text-slate-400 uppercase tracking-wide">Recruiter Panel</div>
+              <div className="text-xs font-semibold truncate text-white">Administrator</div>
             </div>
           </div>
         </div>
@@ -261,17 +264,20 @@ export default function App() {
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col min-w-0 h-full overflow-hidden">
         {/* Top Header */}
-        <header className="h-16 bg-white border-b border-slate-200 px-6 sm:px-8 flex items-center justify-between shrink-0">
-          <div className="flex items-center space-x-2 text-sm text-slate-500 font-medium truncate">
+        <header className="h-16 bg-white border-b border-neutral-200 px-6 sm:px-8 flex items-center justify-between shrink-0">
+          <div className="flex items-center space-x-2 text-sm text-ink/60 font-medium truncate">
             <button 
-              onClick={() => setSelectedInterview(null)}
-              className="hover:text-indigo-600 transition-colors cursor-pointer font-semibold"
+              onClick={() => {
+                setAdminView('dashboard');
+                setSelectedInterview(null);
+              }}
+              className="hover:text-emerald-accent transition-colors cursor-pointer font-semibold"
             >
               Interviews
             </button>
-            <span className="text-slate-300">/</span>
-            <span className="text-slate-900 truncate font-semibold">
-              {selectedInterview ? selectedInterview.applicantName : 'Dashboard'}
+            <span className="text-neutral-bg/50">/</span>
+            <span className="text-ink truncate font-semibold">
+              {selectedInterview ? selectedInterview.applicantName : adminView === 'create' ? 'Create New' : 'Dashboard'}
             </span>
           </div>
           <div className="flex space-x-3 shrink-0">
@@ -283,51 +289,61 @@ export default function App() {
                   navigator.clipboard.writeText(shareLink);
                   alert("Shareable candidate interview link copied to clipboard!");
                 }}
-                className="px-4 py-2 border border-slate-200 rounded-lg text-sm font-semibold hover:bg-slate-50 transition-colors cursor-pointer"
+                className="px-4 py-2 bg-slate text-neutral-bg text-xs border border-graphite rounded-lg font-semibold hover:bg-ink transition-colors duration-200 cursor-pointer shadow-sm flex items-center gap-1.5"
               >
-                Copy Link
+                <Sparkles className="w-3.5 h-3.5 text-emerald-accent" />
+                Copy Share Link
               </button>
             )}
           </div>
         </header>
 
         {/* Scrollable Layout Content */}
-        <div className="flex-1 p-6 sm:p-8 overflow-y-auto bg-[#F8FAFC]">
-          <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-            {/* Left column: Create Form + Interview Directory */}
-            <div className="lg:col-span-5 space-y-6">
-              <CreateInterview onInterviewCreated={refreshInterviewList} />
-              
-              <InterviewList
-                key={listRefreshKey}
-                onSelectInterview={(selected) => setSelectedInterview(selected)}
-                selectedInterviewId={selectedInterview?.id}
-                onDeleteSuccess={() => setSelectedInterview(null)}
+        <div className="flex-1 p-6 sm:p-8 overflow-y-auto bg-neutral-bg">
+          {adminView === 'create' ? (
+            <div className="max-w-3xl mx-auto">
+              <CreateInterview 
+                onInterviewCreated={() => {
+                  refreshInterviewList();
+                  setAdminView('dashboard');
+                }} 
               />
             </div>
-
-            {/* Right column: Selected candidate detailed assessment dossier report */}
-            <div className="lg:col-span-7">
-              {selectedInterview ? (
-                <InterviewDetail 
-                  interviewId={selectedInterview.id} 
+          ) : (
+            <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+              {/* Left column: Interview Directory */}
+              <div className="lg:col-span-5 space-y-6">
+                <InterviewList
+                  key={listRefreshKey}
+                  onSelectInterview={(selected) => setSelectedInterview(selected)}
+                  selectedInterviewId={selectedInterview?.id}
                   onDeleteSuccess={() => setSelectedInterview(null)}
                 />
-              ) : (
-                <div className="bg-white rounded-xl border border-slate-200 p-12 shadow-sm text-center min-h-[400px] flex flex-col justify-center items-center space-y-4">
-                  <div className="h-16 w-16 bg-indigo-50 rounded-2xl flex items-center justify-center text-indigo-500">
-                    <Bot className="h-8 w-8" />
+              </div>
+
+              {/* Right column: Selected candidate detailed assessment dossier report */}
+              <div className="lg:col-span-7 lg:sticky lg:top-0 lg:max-h-[calc(100vh-8rem)] lg:overflow-y-auto pr-2">
+                {selectedInterview ? (
+                  <InterviewDetail 
+                    interviewId={selectedInterview.id} 
+                    onDeleteSuccess={() => setSelectedInterview(null)}
+                  />
+                ) : (
+                  <div className="bg-white rounded-xl border border-neutral-bg/20 p-12 shadow-sm text-center min-h-[400px] flex flex-col justify-center items-center space-y-4">
+                    <div className="h-16 w-16 bg-emerald-accent/10 rounded-2xl flex items-center justify-center text-emerald-accent shadow-sm">
+                      <Bot className="h-8 w-8" />
+                    </div>
+                    <div className="space-y-1.5 max-w-sm">
+                      <h3 className="font-display font-bold text-lg text-ink">Applicant Overview</h3>
+                      <p className="text-xs text-ink/60 leading-relaxed">
+                        Select an interview from the directory on the left to review automated transcripts, webcam recordings, score breakdowns, and hire/no-hire decision reports.
+                      </p>
+                    </div>
                   </div>
-                  <div className="space-y-1.5 max-w-sm">
-                    <h3 className="font-display font-bold text-lg text-slate-900">Applicant Dossier Viewer</h3>
-                    <p className="text-xs text-slate-500 leading-relaxed">
-                      Select an interview from the directory directory on the left to review automated transcripts, webcam recordings, score breakdowns, and hire/no-hire decision reports.
-                    </p>
-                  </div>
-                </div>
-              )}
+                )}
+              </div>
             </div>
-          </div>
+          )}
         </div>
       </main>
     </div>

@@ -19,12 +19,19 @@ class AudioQueuePlayer {
   private onStateChange: (isPlaying: boolean) => void;
   private activeSources: AudioBufferSourceNode[] = [];
   private recordingDestination: MediaStreamAudioDestinationNode | null = null;
+  public analyser: AnalyserNode;
 
   constructor(audioCtx: AudioContext, recordingDestination: MediaStreamAudioDestinationNode | null, onStateChange: (isPlaying: boolean) => void) {
     this.audioCtx = audioCtx;
     this.recordingDestination = recordingDestination;
     this.onStateChange = onStateChange;
     this.nextPlayTime = this.audioCtx.currentTime;
+
+    // Create an AnalyserNode to measure actual output amplitude
+    this.analyser = this.audioCtx.createAnalyser();
+    this.analyser.fftSize = 256;
+    // Connect the analyser to the main output
+    this.analyser.connect(this.audioCtx.destination);
   }
 
   playChunk(float32Array: Float32Array) {
@@ -37,7 +44,9 @@ class AudioQueuePlayer {
 
     const source = this.audioCtx.createBufferSource();
     source.buffer = buffer;
-    source.connect(this.audioCtx.destination);
+    
+    // Connect source to our analyser
+    source.connect(this.analyser);
     
     if (this.recordingDestination) {
       source.connect(this.recordingDestination);
@@ -128,6 +137,148 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
     }
   }, [micMuted]);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    let animationFrameId: number;
+    let phase = 0;
+
+    const draw = () => {
+      animationFrameId = requestAnimationFrame(draw);
+
+      // Handle high-dpi screens dynamically
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+
+      ctx.clearRect(0, 0, width, height);
+
+      // Get real-time audio volume from analyser
+      let volume = 0;
+      if (audioPlayerRef.current && audioPlayerRef.current.analyser) {
+        const analyser = audioPlayerRef.current.analyser;
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          sum += dataArray[i];
+        }
+        volume = sum / dataArray.length / 255; // 0 to 1
+      }
+
+      // If active speaking state has some buffering or brief silent gap, simulate a tiny organic pulse
+      if (isAiSpeaking && volume < 0.08) {
+        volume = 0.12 + Math.sin(Date.now() / 120) * 0.04;
+      }
+
+      phase += 0.04 + volume * 0.12;
+
+      const centerX = width / 2;
+      const centerY = height / 2;
+      const baseRadius = 44; // Fits beautifully inside a 192px/192px (w-48 h-48) canvas
+
+      // Draw subtle backing glow/pulses when speaking
+      if (volume > 0) {
+        // Outer pulsing gradient
+        const outerGlow = ctx.createRadialGradient(centerX, centerY, baseRadius - 10, centerX, centerY, baseRadius + 30 + volume * 40);
+        outerGlow.addColorStop(0, 'rgba(16, 185, 129, 0.15)');
+        outerGlow.addColorStop(0.5, 'rgba(16, 185, 129, 0.05)');
+        outerGlow.addColorStop(1, 'rgba(16, 185, 129, 0)');
+        ctx.fillStyle = outerGlow;
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, baseRadius + 30 + volume * 40, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        // Subtle ambient ring glow when idle
+        const outerGlow = ctx.createRadialGradient(centerX, centerY, baseRadius - 5, centerX, centerY, baseRadius + 10);
+        outerGlow.addColorStop(0, 'rgba(255, 255, 255, 0.01)');
+        outerGlow.addColorStop(1, 'rgba(255, 255, 255, 0)');
+        ctx.fillStyle = outerGlow;
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, baseRadius + 10, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Draw solid central circle background (sleek deep graphite)
+      ctx.beginPath();
+      ctx.arc(centerX, centerY, baseRadius, 0, Math.PI * 2);
+      ctx.fillStyle = '#1D2939'; // Sleek dark slate gray (graphite)
+      ctx.fill();
+
+      // Draw rippling/distorted border/ring
+      const points = 120;
+      
+      // Outer rippling eco-ring (only when speaking)
+      if (volume > 0) {
+        ctx.beginPath();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = 'rgba(16, 185, 129, 0.35)';
+        for (let i = 0; i <= points; i++) {
+          const angle = (i / points) * Math.PI * 2;
+          let r = baseRadius + 8;
+          // Fluid organic ripples
+          const wave1 = Math.sin(angle * 4 - phase * 1.2) * 5;
+          const wave2 = Math.cos(angle * 7 + phase * 1.8) * 3;
+          r += (wave1 + wave2) * volume * 2.0;
+          
+          const x = centerX + Math.cos(angle) * r;
+          const y = centerY + Math.sin(angle) * r;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+        ctx.stroke();
+      }
+
+      // Primary rippling ring (always present, but distorting/pulsating when speaking, static when idle)
+      ctx.beginPath();
+      ctx.lineWidth = volume > 0 ? 3.5 : 2.5;
+      ctx.strokeStyle = volume > 0 ? 'rgba(16, 185, 129, 0.95)' : 'rgba(255, 255, 255, 0.65)';
+      
+      // Add neon-like shadow to the primary stroke when speaking
+      if (volume > 0) {
+        ctx.shadowColor = 'rgba(16, 185, 129, 0.8)';
+        ctx.shadowBlur = 10 + volume * 15;
+      } else {
+        ctx.shadowBlur = 0;
+      }
+
+      for (let i = 0; i <= points; i++) {
+        const angle = (i / points) * Math.PI * 2;
+        let r = baseRadius;
+        if (volume > 0) {
+          const wave1 = Math.sin(angle * 6 - phase * 1.5) * 6;
+          const wave2 = Math.cos(angle * 10 + phase * 2.2) * 4;
+          r += (wave1 + wave2) * volume * 2.2;
+        }
+        
+        const x = centerX + Math.cos(angle) * r;
+        const y = centerY + Math.sin(angle) * r;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+      ctx.stroke();
+
+      // Reset shadow configuration for next renders
+      ctx.shadowBlur = 0;
+    };
+
+    draw();
+
+    return () => {
+      cancelAnimationFrame(animationFrameId);
+    };
+  }, [isAiSpeaking]);
   
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -1202,28 +1353,40 @@ registerProcessor('mic-processor', MicProcessor);
     return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
   };
 
+  const ratio = timeLeft / ((interview?.duration || 10) * 60);
+  const elapsedRatio = 1 - ratio; // percentage of total time elapsed
+  const timerColorClass = elapsedRatio >= 0.80 
+    ? 'border-rose-500/30 bg-rose-500/5 text-rose-500 animate-pulse' 
+    : elapsedRatio >= 0.60 
+      ? 'border-amber-accent/30 bg-amber-accent/5 text-amber-accent' 
+      : 'border-emerald-accent/30 bg-emerald-accent/5 text-emerald-accent';
+  const timerIconClass = elapsedRatio >= 0.80 
+    ? 'text-rose-500' 
+    : elapsedRatio >= 0.60 
+      ? 'text-amber-accent' 
+      : 'text-emerald-accent';
+
   return (
-    <div className="min-h-screen bg-slate-950 text-white flex flex-col font-sans" id="live-interview-canvas">
+    <div className="min-h-screen bg-ink text-white flex flex-col font-sans" id="live-interview-canvas">
       {/* Top Header details */}
-      <div className="border-b border-slate-900 px-6 py-4 flex items-center justify-between">
+      <div className="border-b border-graphite px-6 py-4 flex items-center justify-between bg-slate">
         <div className="flex items-center gap-3">
-          <Bot className="h-5 w-5 text-indigo-400" />
           <div>
-            <h1 className="text-sm font-bold tracking-tight">InterviewAI Active Terminal</h1>
-            <p className="text-[10px] text-slate-400">Target: {interview?.jobTitle}</p>
+            <h1 className="text-xs sm:text-sm font-bold tracking-tight font-display text-white">Interview in Session</h1>
+            <p className="text-[10px] text-neutral-bg/50 font-mono mt-0.5">Target Position: {interview?.jobTitle}</p>
           </div>
         </div>
 
         {/* Time and Finish Early Controls */}
         <div className="flex items-center gap-4">
-          <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-300 font-mono">
-            <Timer className="h-4 w-4 text-indigo-400" />
+          <div className={`flex items-center gap-1.5 border rounded-lg px-3 py-1.5 text-xs font-mono transition-all duration-300 ${timerColorClass}`}>
+            <Timer className={`h-4 w-4 shrink-0 ${timerIconClass}`} />
             <span>Time Budget: {formatTime(timeLeft)}</span>
           </div>
           <button
             onClick={() => handleCompleteInterview('button')}
             disabled={isSubmitting}
-            className="flex items-center gap-1.5 bg-rose-600 hover:bg-rose-500 disabled:bg-rose-800 text-white px-4 py-1.5 text-xs font-semibold rounded-lg transition-colors cursor-pointer"
+            className="flex items-center gap-1.5 bg-rose-600 hover:bg-rose-500 disabled:bg-rose-800 text-white px-4 py-1.5 text-xs font-bold font-mono rounded-lg transition-colors cursor-pointer"
           >
             <PhoneOff className="h-3.5 w-3.5" /> End Interview
           </button>
@@ -1234,42 +1397,39 @@ registerProcessor('mic-processor', MicProcessor);
       <div className="flex-1 grid grid-cols-1 md:grid-cols-2 p-6 gap-6">
         
         {/* Left Side: Animated AI Avatar */}
-        <div className="bg-slate-900/60 border border-slate-900 rounded-2xl flex flex-col items-center justify-center p-8 relative overflow-hidden min-h-[300px]">
+        <div className="bg-slate border border-graphite rounded-2xl flex flex-col items-center justify-center p-8 relative overflow-hidden min-h-[300px]">
           <div className="absolute top-4 left-4 flex items-center gap-2">
             <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-accent opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-accent"></span>
             </span>
-            <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">AI Host Active</span>
+            <span className="text-[10px] uppercase font-bold text-neutral-bg/50 tracking-wider font-mono">Session Active</span>
           </div>
 
-          <div className="space-y-6 text-center z-10">
-            {/* AI Avatar Pulse */}
-            <div className="flex justify-center">
-              <div className={`h-24 w-24 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center transition-all ${isAiSpeaking ? 'pulse-ai' : 'scale-95 opacity-80'}`}>
-                <Bot className="h-10 w-10 text-white" />
+          <div className="space-y-6 text-center z-10 w-full max-w-sm">
+            {/* AI Avatar Circular Reactive Visualizer */}
+            <div className="flex flex-col items-center justify-center gap-6">
+              <div className="h-48 w-48 flex items-center justify-center relative">
+                <canvas ref={canvasRef} className="w-full h-full opacity-100" />
               </div>
             </div>
 
-            <div className="space-y-1.5 max-w-sm">
-              <h3 className="text-sm font-semibold tracking-wide">
-                {isAiSpeaking ? 'AI Interrogator Speaking...' : 'AI Host is Listening...'}
+            <div className="space-y-1.5">
+              <h3 className="text-sm font-bold tracking-wide font-display text-white min-h-[24px]">
+                {isAiSpeaking ? 'Interviewer Speaking...' : 'Interviewer Listening...'}
               </h3>
-              <p className="text-[11px] text-slate-400 leading-relaxed">
-                The AI will conduct the interview automatically. Speak naturally when the AI finishes speaking.
-              </p>
             </div>
           </div>
         </div>
 
         {/* Right Side: Candidate webcam preview */}
-        <div className="bg-slate-900/60 border border-slate-900 rounded-2xl relative overflow-hidden min-h-[300px] flex items-center justify-center">
+        <div className="bg-slate border border-graphite rounded-2xl relative overflow-hidden min-h-[300px] flex items-center justify-center">
           <div className="absolute top-4 left-4 flex items-center gap-2 z-20">
             <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-500 opacity-75"></span>
               <span className="relative inline-flex rounded-full h-2 w-2 bg-rose-500"></span>
             </span>
-            <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Webcam Streaming & Recording</span>
+            <span className="text-[10px] uppercase font-bold text-neutral-bg/50 tracking-wider font-mono">Camera Recording</span>
           </div>
 
           {/* Local camera preview */}
@@ -1284,57 +1444,53 @@ registerProcessor('mic-processor', MicProcessor);
             autoPlay
             playsInline
             muted
-            className="absolute inset-0 w-full h-full object-cover scale-x-[-1] z-10"
+            className="absolute inset-0 w-full h-full object-cover scale-x-[-1] z-10 opacity-90 transition-opacity duration-500"
           />
 
           {/* Mic controls */}
-          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex gap-2">
+          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20">
             <button
               onClick={toggleMic}
-              className={`p-3 rounded-full cursor-pointer transition-colors border ${
+              className={`p-3 rounded-full cursor-pointer transition-all duration-200 border ${
                 micMuted 
                   ? 'bg-rose-600 border-rose-500 hover:bg-rose-500 text-white' 
-                  : 'bg-slate-800/80 border-slate-700 hover:bg-slate-700 text-slate-200'
+                  : 'bg-graphite/90 border-slate hover:bg-slate text-neutral-bg shadow-lg'
               }`}
             >
               {micMuted ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
             </button>
-            <div className="flex items-center gap-1 bg-slate-900/90 border border-slate-800 rounded-full px-4 text-xs font-semibold text-slate-200">
-              <Volume2 className="h-4 w-4 text-indigo-400" />
-              <span>Voice Detection On</span>
-            </div>
           </div>
         </div>
 
       </div>
 
       {/* Real-time Subtitles / Dialog Log */}
-      <div className="border-t border-slate-900 px-6 py-4 bg-slate-950/80 max-h-48 overflow-y-auto">
-        <span className="text-[9px] uppercase tracking-wider font-bold text-slate-500 block mb-2">
-          Live Session Transcription Transcript
+      <div className="border-t border-graphite px-6 py-4 bg-slate max-h-48 overflow-y-auto">
+        <span className="text-[10px] uppercase tracking-wider font-bold text-neutral-bg/40 block mb-2 font-mono">
+          Live Session Dialogue Log (Capturing...)
         </span>
         <div className="space-y-2">
           {transcript.slice(-2).map((item, index) => (
-            <div key={index} className="flex gap-2 items-start text-xs leading-relaxed animate-fade-in">
-              <span className={`font-bold shrink-0 ${item.sender === 'AI' ? 'text-indigo-400' : 'text-slate-300'}`}>
+            <div key={index} className="flex gap-2 items-start text-xs leading-relaxed animate-fade-in font-mono">
+              <span className={`font-bold shrink-0 ${item.sender === 'AI' ? 'text-emerald-accent' : 'text-amber-accent'}`}>
                 {item.sender === 'AI' ? 'AI Host:' : 'You:'}
               </span>
-              <p className="text-slate-300">{item.text}</p>
+              <p className="text-neutral-bg/80">{item.text}</p>
             </div>
           ))}
           {transcript.length === 0 && (
-            <span className="text-xs text-slate-500 italic">Connecting and initializing audio session. AI will speak momentarily...</span>
+            <span className="text-xs text-neutral-bg/40 italic font-mono">Connecting and initializing audio session. AI will speak momentarily...</span>
           )}
         </div>
       </div>
 
       {/* Overlay Submission loader */}
       {isSubmitting && (
-        <div className="fixed inset-0 bg-slate-950/90 flex flex-col items-center justify-center z-50 p-4 space-y-4">
-          <div className="h-12 w-12 animate-spin rounded-full border-4 border-indigo-500 border-t-transparent" />
+        <div className="fixed inset-0 bg-ink/95 flex flex-col items-center justify-center z-50 p-4 space-y-4">
+          <div className="h-12 w-12 animate-spin rounded-full border-4 border-emerald-accent border-t-transparent" />
           <div className="text-center">
-            <h2 className="text-lg font-bold">Uploading webcam recording & generating AI evaluation dossier...</h2>
-            <p className="text-xs text-slate-400 mt-1">Please wait. Do not close your browser tab.</p>
+            <h2 className="text-base font-bold font-display text-white">Uploading webcam recording & compiling AI evaluation dossier...</h2>
+            <p className="text-xs text-neutral-bg/40 mt-1 font-mono">Please keep this browser window open. Finalizing session data.</p>
           </div>
         </div>
       )}
