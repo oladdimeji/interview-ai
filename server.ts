@@ -219,7 +219,33 @@ Provide a comprehensive, professional, and objective analysis of the candidate's
     }
 
     // Parse the JSON result
-    const assessment = JSON.parse(parsedText);
+    let assessment;
+    try {
+      assessment = JSON.parse(parsedText);
+    } catch (parseErr: any) {
+      console.error("[Server AI Assessment] JSON parsing failed. raw text length:", parsedText.length);
+      let position = -1;
+      const matchPos = parseErr.message?.match(/at position (\d+)/i);
+      if (matchPos && matchPos[1]) {
+        position = parseInt(matchPos[1], 10);
+      } else {
+        const matchPos2 = parseErr.message?.match(/position (\d+)/i);
+        if (matchPos2 && matchPos2[1]) {
+          position = parseInt(matchPos2[1], 10);
+        }
+      }
+
+      if (position >= 0 && position < parsedText.length) {
+        const start = Math.max(0, position - 100);
+        const end = Math.min(parsedText.length, position + 100);
+        const snippet = parsedText.slice(start, end);
+        const pointer = " ".repeat(position - start) + "^";
+        console.error(`[Server AI Assessment] Parse error around position ${position}:\n>>>\n${snippet}\n>>>\n${pointer}`);
+      } else {
+        console.error(`[Server AI Assessment] Complete raw response text:\n>>>\n${parsedText}\n>>>`);
+      }
+      throw parseErr;
+    }
 
     // 5. Update interview document with assessment results
     const updateFields: any = {
@@ -543,331 +569,492 @@ if (!fs.existsSync(recordingsDir)) {
 // Register static route to serve local recordings
 app.use("/recordings", express.static(recordingsDir));
 
-// Server-side Video Chunked Upload Endpoint
+// Progressive sequential chunk uploading state and mapping
+interface ProgressiveState {
+  nextExpectedIndex: number;
+  lastActivity: number;
+}
+const progressiveStates = new Map<string, ProgressiveState>();
+
+// Server-side Video Chunked Upload Endpoint (append chunks progressively as they arrive)
 app.post("/api/upload-video-chunk", express.raw({ type: "*/*", limit: "15mb" }), async (req, res) => {
   const interviewId = req.query.interviewId as string;
   const chunkIndexStr = req.query.chunkIndex as string;
-  const totalChunksStr = req.query.totalChunks as string;
 
   if (!interviewId) {
     return res.status(400).json({ error: "interviewId query parameter is required" });
   }
-  if (!chunkIndexStr || !totalChunksStr) {
-    return res.status(400).json({ error: "chunkIndex and totalChunks query parameters are required" });
+  if (!chunkIndexStr) {
+    return res.status(400).json({ error: "chunkIndex query parameter is required" });
   }
 
   const chunkIndex = parseInt(chunkIndexStr, 10);
-  const totalChunks = parseInt(totalChunksStr, 10);
-
-  if (isNaN(chunkIndex) || isNaN(totalChunks)) {
-    return res.status(400).json({ error: "chunkIndex and totalChunks must be valid integers" });
+  if (isNaN(chunkIndex)) {
+    return res.status(400).json({ error: "chunkIndex must be a valid integer" });
   }
 
   const chunkBuffer = req.body;
   const bufferLength = chunkBuffer ? chunkBuffer.length : 0;
 
-  console.log(`[Server Chunk Upload] Received chunk ${chunkIndex + 1}/${totalChunks} for interview ${interviewId}, size: ${bufferLength} bytes`);
+  console.log(`[Server Chunk Upload] Received chunk ${chunkIndex} for interview ${interviewId}, size: ${bufferLength} bytes`);
 
   if (!chunkBuffer || bufferLength === 0) {
     return res.status(400).json({ error: "No chunk data received or buffer is empty" });
   }
 
   // Create temporary directory for chunks of this interview
-  const tempDir = path.join(recordingsDir, `temp_${interviewId}`);
+  const tempDir = path.join(recordingsDir, `temp_progressive_${interviewId}`);
   if (!fs.existsSync(tempDir)) {
     fs.mkdirSync(tempDir, { recursive: true });
   }
+
+  // Initialize/retrieve progressive state
+  let state = progressiveStates.get(interviewId);
+  if (!state) {
+    state = { nextExpectedIndex: 0, lastActivity: Date.now() };
+    progressiveStates.set(interviewId, state);
+
+    // Clean up any stale partial files from a previous crashed run of the same interview ID
+    const completeFile = path.join(tempDir, "complete.webm");
+    if (fs.existsSync(completeFile)) {
+      try { fs.unlinkSync(completeFile); } catch (e) {}
+    }
+  }
+  state.lastActivity = Date.now();
 
   // Write this chunk to disk
   const chunkFilePath = path.join(tempDir, `chunk_${chunkIndex}`);
   try {
     fs.writeFileSync(chunkFilePath, chunkBuffer);
-    console.log(`[Server Chunk Upload] Saved chunk ${chunkIndex + 1}/${totalChunks} to: ${chunkFilePath}`);
+    console.log(`[Server Chunk Upload] Saved chunk file: ${chunkFilePath}`);
   } catch (err: any) {
     console.error(`[Server Chunk Upload] Failed to write chunk ${chunkIndex} to disk:`, err);
     return res.status(500).json({ error: `Failed to write chunk to disk: ${err.message}` });
   }
 
-  // Check if we have received all chunks
-  let allChunksReceived = true;
-  for (let i = 0; i < totalChunks; i++) {
-    const expectedChunkPath = path.join(tempDir, `chunk_${i}`);
-    if (!fs.existsSync(expectedChunkPath)) {
-      allChunksReceived = false;
-      break;
+  // Sequentially append any consecutive completed chunks that are ready
+  const completeFilePath = path.join(tempDir, "complete.webm");
+  try {
+    while (true) {
+      const nextChunkPath = path.join(tempDir, `chunk_${state.nextExpectedIndex}`);
+      if (fs.existsSync(nextChunkPath)) {
+        const buf = fs.readFileSync(nextChunkPath);
+        fs.appendFileSync(completeFilePath, buf);
+        console.log(`[Server Chunk Upload] Appended chunk_${state.nextExpectedIndex} to complete.webm`);
+        
+        state.nextExpectedIndex++;
+        
+        // Clean up individual chunk file after successfully appending to free up disk space
+        try {
+          fs.unlinkSync(nextChunkPath);
+        } catch (unlinkErr) {
+          console.warn(`[Server Chunk Upload] Failed to remove merged chunk file:`, unlinkErr);
+        }
+      } else {
+        break;
+      }
     }
+  } catch (appendErr: any) {
+    console.error(`[Server Chunk Upload] Progressive append failure:`, appendErr);
+    return res.status(500).json({ error: `Progressive video assembly failed: ${appendErr.message}` });
   }
 
-  // If not all chunks have arrived, simply acknowledge current chunk upload
-  if (!allChunksReceived) {
-    return res.json({ success: true, chunkReceived: chunkIndex });
-  }
+  return res.json({ success: true, chunkReceived: chunkIndex });
+});
 
-  // Prevent double execution in highly concurrent environments
+// Server-side Video Finalizer Helper Function (to be called by API or Safeguard check)
+async function finalizeVideo(interviewId: string): Promise<string> {
   if (reassemblingInterviews.has(interviewId)) {
-    console.log(`[Server Chunk Upload] Reassembly already in progress for interview ${interviewId}. Acknowledging chunk index: ${chunkIndex}`);
-    return res.json({ success: true, chunkReceived: chunkIndex, status: "reassembly_in_progress" });
+    console.log(`[Server Finalize] Finalization or reassembly already in progress for interview ${interviewId}`);
+    return "";
   }
   reassemblingInterviews.add(interviewId);
 
-  // Otherwise, all chunks are received! Start reassembly and upload!
-  console.log(`[Server Chunk Upload] All ${totalChunks} chunks received for interview ${interviewId}, reassembling and uploading to Storage...`);
-
-  const localFileName = `${interviewId}.webm`;
-  const localFilePath = path.join(recordingsDir, localFileName);
+  const tempDir = path.join(recordingsDir, `temp_progressive_${interviewId}`);
+  const completeFilePath = path.join(tempDir, "complete.webm");
 
   try {
-    // Reassemble sequentially
+    if (!fs.existsSync(completeFilePath)) {
+      console.error(`[Server Finalize] No complete.webm found for interview ${interviewId} at ${completeFilePath}`);
+      throw new Error("No recorded video segments found on server.");
+    }
+
+    const localFileName = `${interviewId}.webm`;
+    const localFilePath = path.join(recordingsDir, localFileName);
+
+    // Move progressive assembled webm to final place
     if (fs.existsSync(localFilePath)) {
       fs.unlinkSync(localFilePath);
     }
+    fs.renameSync(completeFilePath, localFilePath);
+    console.log(`[Server Finalize] Progressive assembled video moved to: ${localFilePath}`);
 
-    for (let i = 0; i < totalChunks; i++) {
-      const p = path.join(tempDir, `chunk_${i}`);
-      const buf = fs.readFileSync(p);
-      fs.appendFileSync(localFilePath, buf);
-    }
-    console.log(`[Server Chunk Upload] Successfully reassembled complete video locally at: ${localFilePath}`);
-  } catch (reassembleErr: any) {
-    reassemblingInterviews.delete(interviewId);
-    console.error(`[Server Chunk Upload] Reassembly failed:`, reassembleErr);
-    return res.status(500).json({ error: `Video reassembly failed: ${reassembleErr.message}` });
-  }
-
-  // Clean up temporary chunks directory now that we have reassembled the file
-  try {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-    console.log(`[Server Chunk Upload] Temporary chunks directory cleaned up for interview: ${interviewId}`);
-  } catch (cleanupErr) {
-    console.warn(`[Server Chunk Upload] Warning: Failed to clean up temp chunks directory:`, cleanupErr);
-  }
-
-  // Transcode reassembled WebM file to MP4 (H.264/AAC) using ffmpeg
-  const localMp4Name = `${interviewId}.mp4`;
-  const localMp4Path = path.join(recordingsDir, localMp4Name);
-  
-  console.log(`[Server Chunk Upload] Transcoding reassembled WebM to MP4: ${localFilePath} -> ${localMp4Path}`);
-  
-  let finalUploadFilePath = localFilePath;
-  let finalMimeType = "video/webm";
-  let finalFileName = `recordings/${interviewId}.webm`;
-  let isTranscoded = false;
-
-  try {
-    const startTime = Date.now();
-    const cmd = `ffmpeg -i "${localFilePath}" -vcodec libx264 -acodec aac -preset fast -y "${localMp4Path}"`;
-    
-    await execPromise(cmd);
-    const durationMs = Date.now() - startTime;
-    console.log(`[Server Chunk Upload] ffmpeg conversion completed in ${durationMs}ms.`);
-
-    // Log the resulting file size and duration on success
-    const stats = fs.statSync(localMp4Path);
-    const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
-    
-    // Get duration via ffprobe
-    let durationSeconds = 0;
+    // Clean up progressive state and temporary directories
     try {
-      const probeCmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${localMp4Path}"`;
-      const { stdout: probeStdout } = await execPromise(probeCmd);
-      durationSeconds = parseFloat(probeStdout.trim());
-      console.log(`[Server Chunk Upload] Converted MP4 metadata: Size = ${fileSizeMB} MB, Duration = ${durationSeconds} seconds.`);
-    } catch (probeErr: any) {
-      console.warn(`[Server Chunk Upload] Failed to extract duration via ffprobe:`, probeErr?.message || probeErr);
-    }
-
-    finalUploadFilePath = localMp4Path;
-    finalMimeType = "video/mp4";
-    finalFileName = `recordings/${interviewId}.mp4`;
-    isTranscoded = true;
-
-  } catch (ffmpegErr: any) {
-    console.error(`[Server Chunk Upload] FFmpeg conversion failed. Raw error:`, ffmpegErr);
-    if (ffmpegErr.stderr) {
-      console.error(`[Server Chunk Upload] FFmpeg stderr:`, ffmpegErr.stderr);
-    }
-    // Set status to failed in Firestore if reassembly or transcoding fails
-    try {
-      const docRef = doc(db, "interviews", interviewId);
-      await updateDoc(docRef, {
-        recordingStatus: "failed"
-      });
-    } catch (dbErr) {
-      console.error(`[Server Chunk Upload] Failed to set status to failed in Firestore:`, dbErr);
-    }
-    reassemblingInterviews.delete(interviewId);
-    return res.status(500).json({ error: `FFmpeg transcoding failed: ${ffmpegErr.message || ffmpegErr}` });
-  }
-
-  // Upload complete reassembled/transcoded file to Google Drive Shared Drive
-  console.log(`[Server Chunk Upload] Starting Google Drive upload for interview: ${interviewId}`);
-  let recordingUrl = "";
-  try {
-    const serviceAccountKeyRaw = process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY;
-    const folderId = process.env.DRIVE_RECORDINGS_FOLDER_ID;
-
-    if (!serviceAccountKeyRaw) {
-      throw new Error("GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY environment variable is not defined");
-    }
-    if (!folderId) {
-      throw new Error("DRIVE_RECORDINGS_FOLDER_ID environment variable is not defined");
-    }
-
-    const credentials = JSON.parse(serviceAccountKeyRaw);
-    const auth = new google.auth.GoogleAuth({
-      credentials,
-      scopes: ["https://www.googleapis.com/auth/drive"],
-    });
-
-    const drive = google.drive({ version: "v3", auth });
-
-    // 1. Create file in Google Drive Shared Folder with retry logic
-    console.log(`[Server Chunk Upload] Uploading file to Google Drive Shared Folder ID: ${folderId}`);
-    const fileMetadata = {
-      name: finalFileName,
-      parents: [folderId],
-    };
-
-    let fileId: string | undefined;
-    const maxDriveRetries = 3;
-    let driveAttempt = 0;
-
-    while (driveAttempt <= maxDriveRetries) {
-      try {
-        console.log(`[Server Chunk Upload] Drive files.create (Attempt ${driveAttempt + 1}/${maxDriveRetries + 1})...`);
-        const media = {
-          mimeType: finalMimeType,
-          body: fs.createReadStream(finalUploadFilePath),
-        };
-        const createResponse = await drive.files.create({
-          supportsAllDrives: true, // Crucial for Shared Drives!
-          requestBody: fileMetadata,
-          media: media,
-          fields: "id",
-        });
-
-        fileId = createResponse.data.id ?? undefined;
-        if (!fileId) {
-          throw new Error("Failed to get file ID from Drive files.create response");
-        }
-
-        if (driveAttempt > 0) {
-          console.log(`[Server Chunk Upload] Google Drive file creation succeeded on retry attempt ${driveAttempt}! File ID: ${fileId}`);
-        } else {
-          console.log(`[Server Chunk Upload] Successfully created file on Drive. File ID: ${fileId}`);
-        }
-        break; // Success
-      } catch (err: any) {
-        const isTransient = isTransientDriveError(err);
-        console.error(`[Server Chunk Upload] Drive files.create Attempt ${driveAttempt + 1} failed (Transient? ${isTransient}). Error:`, err.message || err);
-
-        if (isTransient && driveAttempt < maxDriveRetries) {
-          driveAttempt++;
-          const backoffMs = Math.pow(2, driveAttempt) * 1000; // 2s, 4s, 8s
-          console.log(`[Server Chunk Upload] Retrying Drive files.create in ${backoffMs}ms...`);
-          await new Promise((resolve) => setTimeout(resolve, backoffMs));
-        } else {
-          console.error(`[Server Chunk Upload] Drive files.create permanently failed or retries exhausted.`);
-          throw err;
-        }
-      }
-    }
-
-    // 2. Set domain-level permissions with retry logic
-    let permissionsAttempt = 0;
-    while (permissionsAttempt <= maxDriveRetries) {
-      try {
-        console.log(`[Server Chunk Upload] Setting domain-level 'reader' permissions for workpodd.com on file: ${fileId} (Attempt ${permissionsAttempt + 1}/${maxDriveRetries + 1})`);
-        await drive.permissions.create({
-          fileId: fileId!,
-          supportsAllDrives: true,
-          requestBody: {
-            role: "reader",
-            type: "domain",
-            domain: "workpodd.com",
-          },
-        });
-
-        if (permissionsAttempt > 0) {
-          console.log(`[Server Chunk Upload] Drive permissions.create succeeded on retry attempt ${permissionsAttempt}!`);
-        } else {
-          console.log(`[Server Chunk Upload] Successfully configured permissions for workpodd.com`);
-        }
-        break; // Success
-      } catch (err: any) {
-        const isTransient = isTransientDriveError(err);
-        console.error(`[Server Chunk Upload] Drive permissions.create Attempt ${permissionsAttempt + 1} failed (Transient? ${isTransient}). Error:`, err.message || err);
-
-        if (isTransient && permissionsAttempt < maxDriveRetries) {
-          permissionsAttempt++;
-          const backoffMs = Math.pow(2, permissionsAttempt) * 1000; // 2s, 4s, 8s
-          console.log(`[Server Chunk Upload] Retrying Drive permissions.create in ${backoffMs}ms...`);
-          await new Promise((resolve) => setTimeout(resolve, backoffMs));
-        } else {
-          console.error(`[Server Chunk Upload] Drive permissions.create permanently failed or retries exhausted.`);
-          throw err;
-        }
-      }
-    }
-
-    recordingUrl = `https://drive.google.com/file/d/${fileId}/preview`;
-    console.log(`[Server Chunk Upload] Generated Drive preview URL: ${recordingUrl}`);
-
-    // Clean up local files (both original webm and converted mp4)
-    try {
-      if (fs.existsSync(localFilePath)) {
-        fs.unlinkSync(localFilePath);
-        console.log(`[Server Chunk Upload] Cleaned up local reassembled WebM file: ${localFilePath}`);
-      }
-      if (isTranscoded && fs.existsSync(localMp4Path)) {
-        fs.unlinkSync(localMp4Path);
-        console.log(`[Server Chunk Upload] Cleaned up local transcoded MP4 file: ${localMp4Path}`);
-      }
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      progressiveStates.delete(interviewId);
+      console.log(`[Server Finalize] Progressive state and directory cleaned up for interview: ${interviewId}`);
     } catch (cleanupErr) {
-      console.warn(`[Server Chunk Upload] Failed to clean up local files:`, cleanupErr);
+      console.warn(`[Server Finalize] Failed to clean up temp dir:`, cleanupErr);
     }
 
-    // Update Firestore document with recordingUrl and recordingStatus 'ready'
-    console.log(`[Server Chunk Upload] Updating Firestore document interviews/${interviewId} with recordingUrl: ${recordingUrl}, recordingStatus: ready`);
-    const docRef = doc(db, "interviews", interviewId);
-    await updateDoc(docRef, {
-      recordingUrl: recordingUrl,
-      recordingStatus: "ready"
-    });
-    console.log(`[Server Chunk Upload] Firestore document successfully updated to ready!`);
+    // Transcode reassembled WebM file to MP4 (H.264/AAC) using ffmpeg
+    const localMp4Name = `${interviewId}.mp4`;
+    const localMp4Path = path.join(recordingsDir, localMp4Name);
+    
+    console.log(`[Server Finalize] Transcoding reassembled WebM to MP4: ${localFilePath} -> ${localMp4Path}`);
+    
+    let finalUploadFilePath = localFilePath;
+    let finalMimeType = "video/webm";
+    let finalFileName = `recordings/${interviewId}.webm`;
+    let isTranscoded = false;
 
-    // Clean up reassembling guard
-    reassemblingInterviews.delete(interviewId);
-
-    return res.json({ success: true, url: recordingUrl });
-
-  } catch (driveErr: any) {
-    // Clean up reassembling guard
-    reassemblingInterviews.delete(interviewId);
-
-    console.error(`[Server Chunk Upload] CRITICAL ERROR uploading to Google Drive:`, driveErr);
-    if (driveErr.response) {
-      console.error(`[Server Chunk Upload] Google API Error Response Data:`, JSON.stringify(driveErr.response.data || driveErr.response));
-    }
-
-    // Update Firestore to let the admin know the recording failed
     try {
-      console.log(`[Server Chunk Upload] Updating Firestore document interviews/${interviewId} with recordingStatus: failed`);
+      const startTime = Date.now();
+      const cmd = `ffmpeg -i "${localFilePath}" -vcodec libx264 -acodec aac -preset fast -y "${localMp4Path}"`;
+      
+      await execPromise(cmd);
+      const durationMs = Date.now() - startTime;
+      console.log(`[Server Finalize] ffmpeg conversion completed in ${durationMs}ms.`);
+
+      // Log the resulting file size and duration on success
+      const stats = fs.statSync(localMp4Path);
+      const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+      
+      // Get duration via ffprobe
+      let durationSeconds = 0;
+      try {
+        const probeCmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${localMp4Path}"`;
+        const { stdout: probeStdout } = await execPromise(probeCmd);
+        durationSeconds = parseFloat(probeStdout.trim());
+        console.log(`[Server Finalize] Converted MP4 metadata: Size = ${fileSizeMB} MB, Duration = ${durationSeconds} seconds.`);
+      } catch (probeErr: any) {
+        console.warn(`[Server Finalize] Failed to extract duration via ffprobe:`, probeErr?.message || probeErr);
+      }
+
+      finalUploadFilePath = localMp4Path;
+      finalMimeType = "video/mp4";
+      finalFileName = `recordings/${interviewId}.mp4`;
+      isTranscoded = true;
+
+    } catch (ffmpegErr: any) {
+      console.error(`[Server Finalize] FFmpeg conversion failed. Raw error:`, ffmpegErr);
+      if (ffmpegErr.stderr) {
+        console.error(`[Server Finalize] FFmpeg stderr:`, ffmpegErr.stderr);
+      }
+      // Set status to failed in Firestore if transcoding fails
+      try {
+        const docRef = doc(db, "interviews", interviewId);
+        await updateDoc(docRef, {
+          recordingStatus: "failed"
+        });
+      } catch (dbErr) {
+        console.error(`[Server Finalize] Failed to set status to failed in Firestore:`, dbErr);
+      }
+      throw new Error(`FFmpeg transcoding failed: ${ffmpegErr.message || ffmpegErr}`);
+    }
+
+    // Upload complete reassembled/transcoded file to Google Drive Shared Drive
+    console.log(`[Server Finalize] Starting Google Drive upload for interview: ${interviewId}`);
+    let recordingUrl = "";
+    try {
+      const serviceAccountKeyRaw = process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY;
+      const folderId = process.env.DRIVE_RECORDINGS_FOLDER_ID;
+
+      if (!serviceAccountKeyRaw) {
+        throw new Error("GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY environment variable is not defined");
+      }
+      if (!folderId) {
+        throw new Error("DRIVE_RECORDINGS_FOLDER_ID environment variable is not defined");
+      }
+
+      const credentials = JSON.parse(serviceAccountKeyRaw);
+      const auth = new google.auth.GoogleAuth({
+        credentials,
+        scopes: ["https://www.googleapis.com/auth/drive"],
+      });
+
+      const drive = google.drive({ version: "v3", auth });
+
+      // 1. Create file in Google Drive Shared Folder with retry logic
+      console.log(`[Server Finalize] Uploading file to Google Drive Shared Folder ID: ${folderId}`);
+      const fileMetadata = {
+        name: finalFileName,
+        parents: [folderId],
+      };
+
+      let fileId: string | undefined;
+      const maxDriveRetries = 3;
+      let driveAttempt = 0;
+
+      while (driveAttempt <= maxDriveRetries) {
+        try {
+          console.log(`[Server Finalize] Drive files.create (Attempt ${driveAttempt + 1}/${maxDriveRetries + 1})...`);
+          const media = {
+            mimeType: finalMimeType,
+            body: fs.createReadStream(finalUploadFilePath),
+          };
+          const createResponse = await drive.files.create({
+            supportsAllDrives: true, // Crucial for Shared Drives!
+            requestBody: fileMetadata,
+            media: media,
+            fields: "id",
+          });
+
+          fileId = createResponse.data.id ?? undefined;
+          if (!fileId) {
+            throw new Error("Failed to get file ID from Drive files.create response");
+          }
+
+          if (driveAttempt > 0) {
+            console.log(`[Server Finalize] Google Drive file creation succeeded on retry attempt ${driveAttempt}! File ID: ${fileId}`);
+          } else {
+            console.log(`[Server Finalize] Successfully created file on Drive. File ID: ${fileId}`);
+          }
+          break; // Success
+        } catch (err: any) {
+          const isTransient = isTransientDriveError(err);
+          console.error(`[Server Finalize] Drive files.create Attempt ${driveAttempt + 1} failed (Transient? ${isTransient}). Error:`, err.message || err);
+
+          if (isTransient && driveAttempt < maxDriveRetries) {
+            driveAttempt++;
+            const backoffMs = Math.pow(2, driveAttempt) * 1000; // 2s, 4s, 8s
+            console.log(`[Server Finalize] Retrying Drive files.create in ${backoffMs}ms...`);
+            await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          } else {
+            console.error(`[Server Finalize] Drive files.create permanently failed or retries exhausted.`);
+            throw err;
+          }
+        }
+      }
+
+      // 2. Set domain-level permissions with retry logic
+      let permissionsAttempt = 0;
+      while (permissionsAttempt <= maxDriveRetries) {
+        try {
+          console.log(`[Server Finalize] Setting domain-level 'reader' permissions for workpodd.com on file: ${fileId} (Attempt ${permissionsAttempt + 1}/${maxDriveRetries + 1})`);
+          await drive.permissions.create({
+            fileId: fileId!,
+            supportsAllDrives: true,
+            requestBody: {
+              role: "reader",
+              type: "domain",
+              domain: "workpodd.com",
+            },
+          });
+
+          if (permissionsAttempt > 0) {
+            console.log(`[Server Finalize] Drive permissions.create succeeded on retry attempt ${permissionsAttempt}!`);
+          } else {
+            console.log(`[Server Finalize] Successfully configured permissions for workpodd.com`);
+          }
+          break; // Success
+        } catch (err: any) {
+          const isTransient = isTransientDriveError(err);
+          console.error(`[Server Finalize] Drive permissions.create Attempt ${permissionsAttempt + 1} failed (Transient? ${isTransient}). Error:`, err.message || err);
+
+          if (isTransient && permissionsAttempt < maxDriveRetries) {
+            permissionsAttempt++;
+            const backoffMs = Math.pow(2, permissionsAttempt) * 1000; // 2s, 4s, 8s
+            console.log(`[Server Finalize] Retrying Drive permissions.create in ${backoffMs}ms...`);
+            await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          } else {
+            console.error(`[Server Finalize] Drive permissions.create permanently failed or retries exhausted.`);
+            throw err;
+          }
+        }
+      }
+
+      recordingUrl = `https://drive.google.com/file/d/${fileId}/preview`;
+      console.log(`[Server Finalize] Generated Drive preview URL: ${recordingUrl}`);
+
+      // Clean up local files (both original webm and converted mp4)
+      try {
+        if (fs.existsSync(localFilePath)) {
+          fs.unlinkSync(localFilePath);
+          console.log(`[Server Finalize] Cleaned up local WebM file: ${localFilePath}`);
+        }
+        if (isTranscoded && fs.existsSync(localMp4Path)) {
+          fs.unlinkSync(localMp4Path);
+          console.log(`[Server Finalize] Cleaned up local transcoded MP4 file: ${localMp4Path}`);
+        }
+      } catch (cleanupErr) {
+        console.warn(`[Server Finalize] Failed to clean up local files:`, cleanupErr);
+      }
+
+      // Update Firestore document with recordingUrl and recordingStatus 'ready'
+      console.log(`[Server Finalize] Updating Firestore document interviews/${interviewId} with recordingUrl: ${recordingUrl}, recordingStatus: ready`);
       const docRef = doc(db, "interviews", interviewId);
       await updateDoc(docRef, {
-        recordingStatus: "failed"
+        recordingUrl: recordingUrl,
+        recordingStatus: "ready"
       });
-    } catch (dbErr) {
-      console.error(`[Server Chunk Upload] Failed to set status to failed in Firestore:`, dbErr);
-    }
+      console.log(`[Server Finalize] Firestore document successfully updated to ready!`);
 
+      return recordingUrl;
+
+    } catch (driveErr: any) {
+      console.error(`[Server Finalize] CRITICAL ERROR uploading to Google Drive:`, driveErr);
+      if (driveErr.response) {
+        console.error(`[Server Finalize] Google API Error Response Data:`, JSON.stringify(driveErr.response.data || driveErr.response));
+      }
+
+      // Update Firestore to let the admin know the recording failed
+      try {
+        console.log(`[Server Finalize] Updating Firestore document interviews/${interviewId} with recordingStatus: failed`);
+        const docRef = doc(db, "interviews", interviewId);
+        await updateDoc(docRef, {
+          recordingStatus: "failed"
+        });
+      } catch (dbErr) {
+        console.error(`[Server Finalize] Failed to set status to failed in Firestore:`, dbErr);
+      }
+
+      throw driveErr;
+    }
+  } finally {
+    reassemblingInterviews.delete(interviewId);
+  }
+}
+
+// Server-side Finalize Video Endpoint
+app.post("/api/finalize-video", express.json(), async (req, res) => {
+  const { interviewId } = req.body;
+  if (!interviewId) {
+    return res.status(400).json({ error: "interviewId is required" });
+  }
+
+  console.log(`[Server Finalize] Finalize request received for interview ${interviewId}`);
+  try {
+    const url = await finalizeVideo(interviewId);
+    return res.json({ success: true, url });
+  } catch (err: any) {
     return res.status(500).json({
-      error: `Google Drive upload failed: ${driveErr.message || driveErr}`,
-      details: driveErr.stack || String(driveErr),
-      rawError: driveErr.response?.data || driveErr
+      error: `Failed to finalize video: ${err.message || err}`,
+      details: err.stack || String(err)
     });
   }
 });
+
+// Safeguard check every 15 seconds for abandoned or ended sessions
+setInterval(async () => {
+  const now = Date.now();
+  
+  // Check in-memory maps
+  for (const [interviewId, state] of progressiveStates.entries()) {
+    // 1. Check for abandoned or crashed sessions (inactive for 45 minutes)
+    if (now - state.lastActivity > 45 * 60 * 1000) {
+      console.warn(`[Safeguard] In-memory session ${interviewId} inactive for over 45 minutes. Forcing fail and cleaning up.`);
+      progressiveStates.delete(interviewId);
+
+      try {
+        const docRef = doc(db, "interviews", interviewId);
+        await updateDoc(docRef, {
+          recordingStatus: "failed"
+        });
+        console.log(`[Safeguard] Updated Firestore interviews/${interviewId} recordingStatus to 'failed'`);
+      } catch (err) {
+        console.error(`[Safeguard] Failed to update Firestore for in-memory session ${interviewId}:`, err);
+      }
+
+      const tempDir = path.join(recordingsDir, `temp_progressive_${interviewId}`);
+      if (fs.existsSync(tempDir)) {
+        try {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+          console.log(`[Safeguard] Deleted inactive session temp folder: ${tempDir}`);
+        } catch (err) {
+          console.error(`[Safeguard] Failed to delete temp folder ${tempDir}:`, err);
+        }
+      }
+      continue;
+    }
+
+    // 2. Autocomplete check for ended sessions whose chunk uploads stopped for over 45 seconds
+    if (now - state.lastActivity > 45 * 1000) {
+      try {
+        const docRef = doc(db, "interviews", interviewId);
+        const docSnap = await getDoc(docRef);
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          const interviewEnded = data.status === "completed" || data.status === "processing" || data.status === "failed";
+          const needsFinalize = data.recordingStatus === "uploading";
+          if (interviewEnded && needsFinalize) {
+            console.log(`[Safeguard Autocomplete] Interview ${interviewId} has ended in Firestore, and chunks stopped arriving for 45s. Automatically finalising now.`);
+            try {
+              await finalizeVideo(interviewId);
+              console.log(`[Safeguard Autocomplete] Autocomplete video finalize succeeded for interview ${interviewId}`);
+            } catch (err: any) {
+              console.error(`[Safeguard Autocomplete] Failed to autocomplete video finalize for ${interviewId}:`, err);
+            }
+          }
+        }
+      } catch (dbErr) {
+        console.error(`[Safeguard Autocomplete] Error checking Firestore for ended in-memory session ${interviewId}:`, dbErr);
+      }
+    }
+  }
+
+  // Scan recordings physical directory for lingering folders
+  try {
+    const files = fs.readdirSync(recordingsDir);
+    for (const file of files) {
+      if (file.startsWith("temp_progressive_")) {
+        const folderPath = path.join(recordingsDir, file);
+        const stats = fs.statSync(folderPath);
+        const ageMs = now - stats.mtimeMs;
+
+        if (ageMs > 45 * 1000) {
+          const interviewId = file.replace("temp_progressive_", "");
+          
+          // Skip if already checked via in-memory map
+          if (progressiveStates.has(interviewId)) {
+            continue;
+          }
+
+          try {
+            const docRef = doc(db, "interviews", interviewId);
+            const docSnap = await getDoc(docRef);
+            if (docSnap.exists()) {
+              const data = docSnap.data();
+              const interviewEnded = data.status === "completed" || data.status === "processing" || data.status === "failed";
+              const needsFinalize = data.recordingStatus === "uploading";
+              if (interviewEnded && needsFinalize) {
+                console.log(`[Safeguard Autocomplete] Lingering physical folder ${file} found. Interview has ended but status is still 'uploading'. Finalizing.`);
+                try {
+                  await finalizeVideo(interviewId);
+                } catch (err) {
+                  console.error(`[Safeguard Autocomplete] Failed to finalize lingering physical folder ${file}:`, err);
+                }
+              } else if (ageMs > 45 * 60 * 1000) {
+                // If it's more than 45 minutes old, clean it up as abandoned
+                console.warn(`[Safeguard] Cleaning up physically abandoned temp folder ${file} (over 45 minutes old)`);
+                try {
+                  fs.rmSync(folderPath, { recursive: true, force: true });
+                } catch (err) {
+                  console.error(`[Safeguard] Failed to remove physically abandoned temp folder ${file}:`, err);
+                }
+              }
+            } else {
+              // No Firestore doc. If folder is old (over 45 minutes), let's clean it up
+              if (ageMs > 45 * 60 * 1000) {
+                console.warn(`[Safeguard] Lingering physical folder ${file} has no Firestore doc and is over 45 minutes old. Deleting.`);
+                try {
+                  fs.rmSync(folderPath, { recursive: true, force: true });
+                } catch (err) {
+                  console.error(`[Safeguard] Failed to delete folder ${folderPath}:`, err);
+                }
+              }
+            }
+          } catch (dbErr) {
+            console.error(`[Safeguard] Error checking Firestore for lingering folder ${file}:`, dbErr);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[Safeguard] Error scanning physical recordingsDir:`, err);
+  }
+}, 15 * 1000);
 
 // WebSocket proxy logic
 wss.on("connection", (ws, request) => {

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
-import { db } from './firebase';
+import { db, auth } from './firebase';
 import { doc, getDoc } from 'firebase/firestore';
+import { onAuthStateChanged, signOut, User } from 'firebase/auth';
 import { Interview } from './types';
 
 // Importing custom components
@@ -10,12 +11,25 @@ import InterviewDetail from './components/InterviewDetail';
 import WaitingRoom from './components/WaitingRoom';
 import LiveInterview from './components/LiveInterview';
 import InterviewComplete from './components/InterviewComplete';
+import Login from './components/Login';
 
-import { Bot, Sparkles } from 'lucide-react';
+import { Bot, Sparkles, LogOut } from 'lucide-react';
 
 export default function App() {
   const [route, setRoute] = useState<{ path: 'admin' | 'candidate'; interviewId?: string }>({ path: 'admin' });
   
+  // Authentication states
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState<boolean>(true);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setCurrentUser(user);
+      setAuthLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
   // Admin dashboard state
   const [adminView, setAdminView] = useState<'dashboard' | 'create'>('dashboard');
   const [selectedInterview, setSelectedInterview] = useState<Interview | null>(null);
@@ -200,6 +214,23 @@ export default function App() {
     );
   }
 
+  // --- ADMIN LOADING STATE ---
+  if (route.path === 'admin' && authLoading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-neutral-bg font-sans">
+        <div className="flex flex-col items-center space-y-4">
+          <div className="h-8 w-8 animate-spin rounded-full border-2 border-emerald-accent border-t-transparent" />
+          <p className="text-xs font-semibold text-slate-500">Checking authorization status...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // --- ADMIN GATED LOGIN SCREEN ---
+  if (route.path === 'admin' && !currentUser) {
+    return <Login />;
+  }
+
   return (
     <div className="min-h-screen lg:h-screen w-full bg-neutral-bg flex flex-col lg:flex-row font-sans text-ink overflow-hidden">
       {/* Sidebar Navigation */}
@@ -249,7 +280,7 @@ export default function App() {
           </button>
         </nav>
 
-        <div className="p-6 border-t border-graphite bg-slate/30">
+        <div className="p-6 border-t border-graphite bg-slate/30 flex items-center justify-between gap-2">
           <div className="flex items-center space-x-3 min-w-0">
             <div className="w-9 h-9 rounded-full bg-slate border border-graphite shrink-0 flex items-center justify-center text-white font-bold uppercase font-display text-xs">
               AD
@@ -258,6 +289,13 @@ export default function App() {
               <div className="text-xs font-semibold truncate text-white">Administrator</div>
             </div>
           </div>
+          <button
+            onClick={() => signOut(auth)}
+            title="Log out"
+            className="p-1.5 rounded-md hover:bg-white/10 text-neutral-bg/60 hover:text-white transition-colors cursor-pointer"
+          >
+            <LogOut className="h-4 w-4" />
+          </button>
         </div>
       </aside>
 

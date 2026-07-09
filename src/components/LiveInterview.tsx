@@ -284,7 +284,11 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
   const wsRef = useRef<WebSocket | null>(null);
   const isConnectingRef = useRef<boolean>(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
+  const pendingChunksRef = useRef<Blob[]>([]);
+  const nextSequenceNumberRef = useRef<number>(0);
+  const uploadQueueRef = useRef<{ blob: Blob; sequence: number }[]>([]);
+  const isUploadingRef = useRef<boolean>(false);
+  const hasRecordingRef = useRef<boolean>(false);
   const audioPlayerRef = useRef<AudioQueuePlayer | null>(null);
   const micAudioContextRef = useRef<AudioContext | null>(null);
   const micProcessorRef = useRef<ScriptProcessorNode | null>(null);
@@ -304,6 +308,110 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
   const candidateTurnStartTimeRef = useRef<number>(0);
   const lastOverLengthTriggeredTimeRef = useRef<number>(0);
   const isAiSpeakingRef = useRef<boolean>(false);
+
+  const flushAccumulatedChunks = () => {
+    if (pendingChunksRef.current.length === 0) return;
+    const chunksToUpload = [...pendingChunksRef.current];
+    pendingChunksRef.current = [];
+    
+    const mergedBlob = new Blob(chunksToUpload, { type: 'video/webm' });
+    const sequence = nextSequenceNumberRef.current++;
+    console.log(`[Chunk Flush] Flushing ${chunksToUpload.length} chunks, sequence: ${sequence}, size: ${mergedBlob.size} bytes`);
+    
+    uploadQueueRef.current.push({ blob: mergedBlob, sequence });
+    processUploadQueue();
+  };
+
+  const processUploadQueue = async () => {
+    if (isUploadingRef.current || uploadQueueRef.current.length === 0) return;
+    isUploadingRef.current = true;
+
+    const item = uploadQueueRef.current[0];
+    const maxRetries = 3;
+    let attempt = 0;
+    let uploadSuccess = false;
+
+    const isTransientClientError = (status: number, errText: string): boolean => {
+      if (status === 503 || status === 502 || status === 504 || status === 429 || status === 408) {
+        return true;
+      }
+      const lower = errText.toLowerCase();
+      if (lower.includes("transient") || lower.includes("rate limit") || lower.includes("timeout") || lower.includes("rate_limit") || lower.includes("503") || lower.includes("502") || lower.includes("504")) {
+        return true;
+      }
+      return false;
+    };
+
+    while (attempt <= maxRetries && !uploadSuccess) {
+      try {
+        console.log(`[Upload Queue] Uploading sequence ${item.sequence} (${item.blob.size} bytes) for interview ${interviewId} (Attempt ${attempt + 1}/${maxRetries + 1})...`);
+        const response = await fetch(`/api/upload-video-chunk?interviewId=${interviewId}&chunkIndex=${item.sequence}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: item.blob
+        });
+
+        if (!response.ok) {
+          const errText = await response.text();
+          const isTransient = isTransientClientError(response.status, errText);
+          console.warn(`[Upload Queue] Chunk ${item.sequence} upload failed with status ${response.status}. Is transient: ${isTransient}. Details: ${errText}`);
+
+          if (isTransient && attempt < maxRetries) {
+            attempt++;
+            const backoffMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s
+            console.log(`[Upload Queue] Retrying chunk ${item.sequence} upload in ${backoffMs}ms...`);
+            await new Promise((resolve) => setTimeout(resolve, backoffMs));
+            continue;
+          } else {
+            console.error(`[Upload Queue] Chunk ${item.sequence} upload permanently failed.`);
+            throw new Error(`Server returned error status ${response.status}: ${errText}`);
+          }
+        }
+
+        const result = await response.json();
+        console.log(`[Upload Queue] Sequence ${item.sequence} uploaded successfully. Response:`, result);
+        uploadSuccess = true;
+      } catch (err: any) {
+        const isNetworkError = err instanceof TypeError || (err.message && err.message.toLowerCase().includes("fetch"));
+        console.error(`[Upload Queue] Exception during chunk ${item.sequence} upload:`, err);
+
+        if (isNetworkError && attempt < maxRetries) {
+          attempt++;
+          const backoffMs = Math.pow(2, attempt) * 1000;
+          console.log(`[Upload Queue] Retrying chunk ${item.sequence} upload in ${backoffMs}ms due to network error...`);
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          continue;
+        } else {
+          console.error(`[Upload Queue] Chunk ${item.sequence} upload permanently failed.`);
+          break;
+        }
+      }
+    }
+
+    if (!uploadSuccess) {
+      console.error(`[Upload Queue] Sequence ${item.sequence} PERMANENTLY FAILED after all retries.`);
+    }
+
+    // Shift item out of queue
+    uploadQueueRef.current.shift();
+    isUploadingRef.current = false;
+
+    // Process next item in the queue
+    processUploadQueue();
+  };
+
+  const waitForUploadQueueToDrain = async () => {
+    return new Promise<void>((resolve) => {
+      const check = () => {
+        if (uploadQueueRef.current.length === 0 && !isUploadingRef.current) {
+          resolve();
+        } else {
+          setTimeout(check, 250);
+        }
+      };
+      check();
+    });
+  };
 
   const getUniqueTimestamp = (): number => {
     const now = Date.now();
@@ -438,7 +546,7 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
     isSubmittingRef.current = true;
     setIsSubmitting(true);
 
-    const hasRecording = recordedChunksRef.current.length > 0;
+    const hasRecording = hasRecordingRef.current;
 
     try {
       // 1. Save final sorted transcript array directly to Firestore
@@ -459,6 +567,12 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
       }
       try { audioPlayerRef.current?.clear(); } catch (e) {}
 
+      // Wait 600ms to ensure final recorder chunks are processed in ondataavailable
+      await new Promise((resolve) => setTimeout(resolve, 600));
+
+      // Flush any remaining unsent recorded data
+      flushAccumulatedChunks();
+
       // 4. Update Firestore status to 'processing' immediately when the interview ends (and set recordingStatus if video is expected)
       const updateData: any = {
         status: 'processing'
@@ -468,217 +582,71 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
       }
       await updateDoc(doc(db, 'interviews', interviewId), updateData);
 
-      // 4. Immediately transition the candidate to the thank-you screen
+      // Show completion screen immediately so the candidate does not wait on assessment or finalize
       onInterviewFinished();
 
-      // 5. Launch background fire-and-forget processing tasks
-      // Task A: Video Upload (Independent)
-      console.log(`Video upload triggered for interview ${interviewId}`);
+      // Perform finalization tasks in the background so the response does not block the UI
       if (hasRecording) {
         (async () => {
           try {
-            console.log(`[Background Process] Video upload triggered for interview ${interviewId}`);
-            // Wait briefly for final video chunks to buffer from the MediaRecorder stop
-            await new Promise((resolve) => setTimeout(resolve, 800));
+            console.log("[Finalizing] Waiting for remaining progressive chunks to finish uploading in background...");
             
-            console.log(`[Background Process] Total recorded chunks collected: ${recordedChunksRef.current.length}`);
-            const videoBlob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
-            console.log(`Recording blob size: ${videoBlob ? videoBlob.size : 0} bytes, MIME type: ${videoBlob ? videoBlob.type : 'undefined'}`);
+            // Wait for upload queue to completely drain, with a maximum timeout (safeguard) of 20 seconds
+            const drainTimeout = new Promise<void>((resolve) => setTimeout(() => {
+              console.warn("[Finalizing] Drain queue timed out (safeguard triggered)!");
+              resolve();
+            }, 20000));
 
-            if (!videoBlob || videoBlob.size === 0) {
-              throw new Error("Recorded video blob is empty or undefined");
-            }
+            await Promise.race([
+              waitForUploadQueueToDrain(),
+              drainTimeout
+            ]);
 
-            // Chunk size: 4MB (4 * 1024 * 1024)
-            const CHUNK_SIZE = 4 * 1024 * 1024;
-            const totalChunks = Math.ceil(videoBlob.size / CHUNK_SIZE);
-            console.log(`[Background Process] Chunking videoBlob of size ${videoBlob.size} into ${totalChunks} chunks of 4MB.`);
+            console.log("[Finalizing] All progressive chunks uploaded or timeout reached. Triggering backend finalize in background...");
 
-            let finalVideoUrl = "";
-            let fallbackUsed = false;
-
-            const CONCURRENCY_LIMIT = 4;
-            let currentQueueIndex = 0;
-            let activeUploadsCount = 0;
-
-            const isTransientClientError = (status: number, errText: string): boolean => {
-              if (status === 503 || status === 502 || status === 504 || status === 429 || status === 408) {
-                return true;
-              }
-              const lower = errText.toLowerCase();
-              if (lower.includes("transient") || lower.includes("rate limit") || lower.includes("timeout") || lower.includes("rate_limit") || lower.includes("503") || lower.includes("502") || lower.includes("504")) {
-                return true;
-              }
-              return false;
-            };
-
-            const uploadTask = async (chunkIndex: number): Promise<{ url?: string; fallbackUsed?: boolean } | null> => {
-              const start = chunkIndex * CHUNK_SIZE;
-              const end = Math.min(start + CHUNK_SIZE, videoBlob.size);
-              const chunkBlob = videoBlob.slice(start, end);
-
-              const maxChunkRetries = 3;
-              let attempt = 0;
-
-              while (true) {
-                try {
-                  console.log(`[Background Process] [Parallel] Uploading chunk ${chunkIndex + 1}/${totalChunks} (${chunkBlob.size} bytes) for interview ${interviewId} (Attempt ${attempt + 1}/${maxChunkRetries + 1})...`);
-
-                  const response = await fetch(`/api/upload-video-chunk?interviewId=${interviewId}&chunkIndex=${chunkIndex}&totalChunks=${totalChunks}`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/octet-stream" },
-                    body: chunkBlob
-                  });
-
-                  if (!response.ok) {
-                    const errText = await response.text();
-                    const status = response.status;
-                    const isTransient = isTransientClientError(status, errText);
-
-                    console.warn(`[Background Process] Chunk ${chunkIndex + 1} upload failed with status ${status}. Is transient: ${isTransient}. Details: ${errText}`);
-
-                    if (isTransient && attempt < maxChunkRetries) {
-                      attempt++;
-                      const backoffMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s
-                      console.log(`[Background Process] Retrying chunk ${chunkIndex + 1} upload in ${backoffMs}ms (Attempt ${attempt}/${maxChunkRetries})...`);
-                      await new Promise((resolve) => setTimeout(resolve, backoffMs));
-                      continue;
-                    } else {
-                      console.error(`[Background Process] Chunk ${chunkIndex + 1} upload permanently failed after retries or non-transient error.`);
-                      throw new Error(`Server returned non-transient error status ${status} for chunk ${chunkIndex}: ${errText}`);
-                    }
-                  }
-
-                  const result = await response.json();
-                  if (attempt > 0) {
-                    console.log(`[Background Process] [Parallel] Chunk ${chunkIndex + 1}/${totalChunks} succeeded on retry attempt ${attempt}!`);
-                  } else {
-                    console.log(`[Background Process] [Parallel] Chunk ${chunkIndex + 1}/${totalChunks} uploaded successfully on first attempt.`);
-                  }
-                  return result;
-
-                } catch (err: any) {
-                  const isNetworkError = err instanceof TypeError || (err.message && err.message.toLowerCase().includes("fetch"));
-                  console.error(`[Background Process] Exception during chunk ${chunkIndex + 1} upload (Network error? ${isNetworkError}):`, err);
-
-                  if (isNetworkError && attempt < maxChunkRetries) {
-                    attempt++;
-                    const backoffMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s
-                    console.log(`[Background Process] Retrying chunk ${chunkIndex + 1} upload in ${backoffMs}ms due to network error (Attempt ${attempt}/${maxChunkRetries})...`);
-                    await new Promise((resolve) => setTimeout(resolve, backoffMs));
-                    continue;
-                  } else {
-                    console.error(`[Background Process] Chunk ${chunkIndex + 1} upload permanently failed (retries exhausted or non-transient error).`);
-                    throw err;
-                  }
-                }
-              }
-            };
-
-            const uploadPool = () => {
-              return new Promise<{ url: string; fallbackUsed: boolean }>((resolve, reject) => {
-                let hasFailed = false;
-                let finalUrlFromPool = "";
-                let fallbackUsedFromPool = false;
-
-                const next = async () => {
-                  if (hasFailed) return;
-                  if (currentQueueIndex >= totalChunks) {
-                    if (activeUploadsCount === 0) {
-                      resolve({ url: finalUrlFromPool, fallbackUsed: fallbackUsedFromPool });
-                    }
-                    return;
-                  }
-
-                  const chunkIndex = currentQueueIndex++;
-                  activeUploadsCount++;
-
-                  try {
-                    const result = await uploadTask(chunkIndex);
-                    if (result && result.url) {
-                      finalUrlFromPool = result.url;
-                      fallbackUsedFromPool = !!result.fallbackUsed;
-                    }
-                    activeUploadsCount--;
-                    next();
-                  } catch (err) {
-                    hasFailed = true;
-                    reject(err);
-                  }
-                };
-
-                // Start initial batch of workers
-                for (let i = 0; i < Math.min(CONCURRENCY_LIMIT, totalChunks); i++) {
-                  next();
-                }
-              });
-            };
-
-            const uploadStartTime = Date.now();
-            const uploadResult = await uploadPool();
-            finalVideoUrl = uploadResult.url;
-            fallbackUsed = uploadResult.fallbackUsed;
-            const uploadDurationMs = Date.now() - uploadStartTime;
-
-            console.log(`[Background Process] All video chunks uploaded in ${(uploadDurationMs / 1000).toFixed(2)}s! Final URL: ${finalVideoUrl}, FallbackUsed: ${fallbackUsed}`);
-
-            // Double check that we received a URL
-            if (!finalVideoUrl) {
-              throw new Error("No video URL returned from the server after all chunks were processed");
-            }
-
-            const finalStatus = fallbackUsed ? 'local_only' : 'ready';
-            await updateDoc(doc(db, 'interviews', interviewId), {
-              recordingUrl: finalVideoUrl,
-              recordingStatus: finalStatus
+            // Call finalize video endpoint
+            const finalizeResponse = await fetch("/api/finalize-video", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ interviewId })
             });
-            console.log(`[Background Process] Updated Firestore recordingStatus to '${finalStatus}' and recordingUrl successfully.`);
-          } catch (uploadErr: any) {
-            console.error("[Background Process] Video upload failed. Full error object:", uploadErr);
-            if (uploadErr && typeof uploadErr === 'object') {
-              console.error("[Background Process] Detailed error info:", {
-                code: uploadErr.code,
-                message: uploadErr.message,
-                name: uploadErr.name,
-                serverResponse: uploadErr.serverResponse,
-                stack: uploadErr.stack,
-                customData: uploadErr.customData
-              });
+
+            if (!finalizeResponse.ok) {
+              const errText = await finalizeResponse.text();
+              throw new Error(`Finalize video failed: ${errText}`);
             }
+
+            console.log("[Finalizing] Finalize video uploaded and transcoded successfully.");
+          } catch (uploadErr) {
+            console.error("[Finalizing] Video finalize failed:", uploadErr);
             try {
               await updateDoc(doc(db, 'interviews', interviewId), {
                 recordingStatus: 'failed'
               });
-              console.log("[Background Process] Updated Firestore recordingStatus to 'failed'.");
-            } catch (dbErr) {
-              console.error("[Background Process] Failed to update Firestore recordingStatus to 'failed':", dbErr);
-            }
+            } catch (e) {}
           }
         })();
-      } else {
-        console.warn(`[Background Process] Video upload skipped for interview ${interviewId} because hasRecording is false.`);
       }
 
-      // Task B: Trigger Backend assessment generation with Firestore propagation delay and exponential backoff retries
+      // Run the /api/assess trigger as an independent, non-blocking background task with retry logic
       (async () => {
-        // Step 1: Wait 1500ms to guarantee Firestore client writes are fully synced and propagated to the backend
-        console.log("[Background Process] Waiting 1500ms for Firestore write propagation before triggering assessment...");
+        // Wait briefly to let preceding state changes settle
         await new Promise((resolve) => setTimeout(resolve, 1500));
 
         const maxRetries = 3;
         let attempt = 0;
         let success = false;
         let lastError: any = null;
+        let nextBackoffMs = 0;
 
         while (attempt <= maxRetries && !success) {
           try {
-            if (attempt > 0) {
-              const backoffMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s
-              console.log(`[Background Process] Retrying assessment in ${backoffMs}ms (Attempt ${attempt}/${maxRetries})...`);
-              await new Promise((resolve) => setTimeout(resolve, backoffMs));
+            if (nextBackoffMs > 0) {
+              console.log(`[Background Assessment] Waiting ${nextBackoffMs}ms before assessment retry (Attempt ${attempt}/${maxRetries})...`);
+              await new Promise((resolve) => setTimeout(resolve, nextBackoffMs));
             }
 
-            console.log(`[Background Process] Triggering backend AI assessment (Attempt ${attempt + 1}/${maxRetries + 1})...`);
+            console.log(`[Background Assessment] Triggering backend AI assessment (Attempt ${attempt + 1}/${maxRetries + 1})...`);
             const response = await fetch('/api/assess', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -686,30 +654,57 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
             });
 
             if (!response.ok) {
+              if (response.status === 429) {
+                // Handle 429 rate limit backoff specifically
+                const retryAfterHeader = response.headers.get('Retry-After');
+                let customDelayMs = 0;
+                if (retryAfterHeader) {
+                  const parsedSeconds = parseInt(retryAfterHeader, 10);
+                  if (!isNaN(parsedSeconds) && parsedSeconds > 0) {
+                    customDelayMs = parsedSeconds * 1000;
+                    console.log(`[Background Assessment] Received 429 Rate Limit. 'Retry-After' header suggests waiting: ${parsedSeconds} seconds.`);
+                  }
+                }
+                if (customDelayMs === 0) {
+                  // Standard longer backoff schedule for 429: ~10s, 20s, 40s
+                  const nextAttemptNumber = attempt + 1;
+                  customDelayMs = nextAttemptNumber === 1 ? 10000 : nextAttemptNumber === 2 ? 20000 : 40000;
+                  console.log(`[Background Assessment] Received 429 Rate Limit. No valid 'Retry-After' header. Using 429 backoff schedule: ${customDelayMs}ms.`);
+                }
+                nextBackoffMs = customDelayMs;
+              } else {
+                // Non-429 standard transient error backoff: 2s, 4s, 8s
+                const nextAttemptNumber = attempt + 1;
+                nextBackoffMs = Math.pow(2, nextAttemptNumber) * 1000;
+                console.log(`[Background Assessment] Received error status ${response.status}. Using standard backoff: ${nextBackoffMs}ms.`);
+              }
               throw new Error(`Assessment API returned non-ok status: ${response.status}`);
             }
 
-            console.log("[Background Process] Backend AI assessment trigger completed successfully!");
+            console.log("[Background Assessment] Backend AI assessment trigger completed successfully!");
             success = true;
           } catch (err: any) {
-            console.error(`[Background Process] Attempt ${attempt + 1} failed:`, err);
+            console.error(`[Background Assessment] Attempt ${attempt + 1} failed:`, err);
             lastError = err;
             attempt++;
+            if (!nextBackoffMs || nextBackoffMs === 0) {
+              nextBackoffMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s fallback
+            }
           }
         }
 
-        // If all retries failed, transition the interview to completed but mark assessmentStatus as failed
+        // If all retries are exhausted, update Firestore with status: 'completed' and assessmentStatus: 'failed'
         if (!success) {
-          console.error(`[Background Process] CRITICAL: All AI assessment attempts failed after ${maxRetries} retries. Last error:`, lastError);
+          console.error(`[Background Assessment] CRITICAL: All AI assessment attempts failed after ${maxRetries} retries. Last error:`, lastError);
           try {
-            console.log(`[Background Process] Setting interview ${interviewId} status to 'completed' and assessmentStatus to 'failed'...`);
+            console.log(`[Background Assessment] Setting interview ${interviewId} status to 'completed' and assessmentStatus to 'failed'...`);
             await updateDoc(doc(db, 'interviews', interviewId), {
               status: 'completed',
               assessmentStatus: 'failed'
             });
-            console.log("[Background Process] Successfully marked assessment as failed in Firestore.");
+            console.log("[Background Assessment] Successfully updated Firestore with failed assessment status.");
           } catch (dbErr) {
-            console.error("[Background Process] Failed to write assessmentStatus 'failed' to Firestore:", dbErr);
+            console.error("[Background Assessment] Failed to update Firestore with failed assessment status:", dbErr);
           }
         }
       })();
@@ -775,7 +770,12 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
 
     // 3. Start local candidate webcam video recording
     try {
-      recordedChunksRef.current = [];
+      pendingChunksRef.current = [];
+      nextSequenceNumberRef.current = 0;
+      uploadQueueRef.current = [];
+      isUploadingRef.current = false;
+      hasRecordingRef.current = false;
+
       const options = { mimeType: 'video/webm;codecs=vp8,opus' };
       
       const recordingStream = new MediaStream();
@@ -790,8 +790,9 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
       const recorder = new MediaRecorder(recordingStream, options);
       recorder.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) {
-          recordedChunksRef.current.push(e.data);
-          console.log(`MediaRecorder chunk received: ${e.data.size} bytes, total chunks so far: ${recordedChunksRef.current.length}`);
+          pendingChunksRef.current.push(e.data);
+          hasRecordingRef.current = true;
+          console.log(`MediaRecorder chunk received: ${e.data.size} bytes, pending chunks count: ${pendingChunksRef.current.length}`);
         }
       };
       recorder.start(1000); // capture 1 second slices
@@ -812,8 +813,9 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
         const recorder = new MediaRecorder(recordingStream);
         recorder.ondataavailable = (e) => {
           if (e.data && e.data.size > 0) {
-            recordedChunksRef.current.push(e.data);
-            console.log(`MediaRecorder chunk received: ${e.data.size} bytes, total chunks so far: ${recordedChunksRef.current.length}`);
+            pendingChunksRef.current.push(e.data);
+            hasRecordingRef.current = true;
+            console.log(`MediaRecorder fallback chunk received: ${e.data.size} bytes, pending chunks count: ${pendingChunksRef.current.length}`);
           }
         };
         recorder.start(1000);
@@ -1098,6 +1100,7 @@ ${existingTranscript.map(t => `[${t.sender}]: ${t.text}`).join('\n')}
 
     // 6. Connect microphone output to WebSocket to stream user speech PCM bytes downsampled to 16kHz
     const setupMicAudio = async () => {
+      if (isAborted) return;
       try {
         console.log("[WS Live] Initializing microphone AudioContext with sampleRate: 16000 for Gemini Live compatibility...");
         const micContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
@@ -1160,7 +1163,7 @@ registerProcessor('mic-processor', MicProcessor);
         URL.revokeObjectURL(workletUrl);
 
         if (isAborted) {
-          micContext.close();
+          try { micContext.close(); } catch (e) {}
           return;
         }
 
@@ -1176,6 +1179,11 @@ registerProcessor('mic-processor', MicProcessor);
         silentGainNode.connect(micContext.destination);
 
         micNode.port.onmessage = (e) => {
+          if (isAborted) {
+            try { micNode.disconnect(); } catch (_) {}
+            try { micContext.close(); } catch (_) {}
+            return;
+          }
           if (micMutedRef.current) return;
           if (!isSetupComplete) {
             console.log("[WS Live] Blocked audio chunk — setup not complete");
@@ -1201,10 +1209,17 @@ registerProcessor('mic-processor', MicProcessor);
           }
         };
       } catch (audioErr) {
+        if (isAborted) return;
         console.error("[WS Live] AudioWorklet initialization failed, falling back to ScriptProcessorNode...", audioErr);
         try {
           const micContext = new (window.AudioContext || (window as any).webkitAudioContext)();
           micAudioContextRef.current = micContext;
+
+          if (isAborted) {
+            try { micContext.close(); } catch (e) {}
+            return;
+          }
+
           const micSource = micContext.createMediaStreamSource(micStream);
           const micProcessor = micContext.createScriptProcessor(2048, 1, 1);
           micProcessorRef.current = micProcessor;
@@ -1213,6 +1228,11 @@ registerProcessor('mic-processor', MicProcessor);
           micProcessor.connect(micContext.destination);
 
           micProcessor.onaudioprocess = (e) => {
+            if (isAborted) {
+              try { micProcessor.disconnect(); } catch (_) {}
+              try { micContext.close(); } catch (_) {}
+              return;
+            }
             if (micMutedRef.current) return;
             if (!isSetupComplete) {
               console.log("[WS Live] Blocked audio chunk — setup not complete");
@@ -1241,10 +1261,17 @@ registerProcessor('mic-processor', MicProcessor);
       }
     };
 
+    // 6. Periodic video chunk flush loop (every 10 seconds)
+    const flushInterval = setInterval(() => {
+      if (isAborted) return;
+      flushAccumulatedChunks();
+    }, 10000);
+
     setupMicAudio();
 
     return () => {
       // Cleanups
+      clearInterval(flushInterval);
       console.log("[WS Live] Cleaning up LiveInterview socket, audio players, and microphone stream connections...");
       isAborted = true;
       isConnectingRef.current = false;
