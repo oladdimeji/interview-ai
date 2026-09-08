@@ -393,7 +393,7 @@ async function uploadCvToDrive(interviewId: string, fileBuffer: Buffer, fileName
 }
 
 // POST /api/interviews - Create new interview with optional CV upload
-app.post("/api/interviews", upload.single("cv"), async (req, res) => {
+app.post("/api/interviews", upload.single("cv") as any, async (req, res) => {
   console.log("[Server Create Interview] Received request body:", req.body);
   const { applicantName, jobTitle, jobDescription, interviewType, duration } = req.body;
 
