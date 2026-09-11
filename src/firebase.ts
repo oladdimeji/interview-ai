@@ -1,7 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import { initializeFirestore } from 'firebase/firestore';
-import { getStorage } from 'firebase/storage';
 
 // Firebase configuration from firebase-applet-config.json
 const firebaseConfig = {
@@ -23,5 +22,3 @@ const isBrowser = typeof window !== 'undefined';
 export const db = initializeFirestore(app, isBrowser ? {
   experimentalForceLongPolling: true,
 } : {}, databaseId || undefined);
-
-export const storage = getStorage(app);

@@ -1,15 +1,18 @@
 import { useEffect, useState, useRef } from 'react';
 import { db } from '../firebase';
-import { doc, getDoc, updateDoc, arrayUnion } from 'firebase/firestore';
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
-import { storage } from '../firebase';
+import { doc, getDoc, updateDoc } from 'firebase/firestore';
 import { Interview, TranscriptEntry } from '../types';
+import { getInterviewClock } from '../interviewClock';
 import { Mic, MicOff, PhoneOff, Video, Volume2, Timer, Bot, User } from 'lucide-react';
 
 interface LiveInterviewProps {
   interviewId: string;
   micStream: MediaStream;
   onInterviewFinished: () => void;
+}
+
+function closeAudioContext(context: AudioContext | null) {
+  if (context && context.state !== 'closed') void context.close().catch(() => {});
 }
 
 // PCM Audio Helper queue player
@@ -126,7 +129,16 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
   const [timeLeft, setTimeLeft] = useState<number>(600); // 10 minutes fallback
   const [isAiSpeaking, setIsAiSpeaking] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [completionError, setCompletionError] = useState<string | null>(null);
+  const completionFailedRef = useRef(false);
   const isSubmittingRef = useRef(false);
+  const hasFinishedRef = useRef(false);
+  const interviewClockRef = useRef<{ startedAt: number; duration: number } | null>(null);
+  const setupCompleteRef = useRef(false);
+  const closingRequestedRef = useRef(false);
+  const earlyConclusionRef = useRef(false);
+  const lastTimeNoticeRef = useRef<number | null>(null);
+  const closingPlaybackRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const handleCompleteInterviewRef = useRef<((trigger: 'button' | 'timer' | 'ai_conclusion') => Promise<void>) | null>(null);
   const [micMuted, setMicMuted] = useState(false);
   const micMutedRef = useRef(micMuted);
@@ -190,9 +202,9 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
       if (volume > 0) {
         // Outer pulsing gradient
         const outerGlow = ctx.createRadialGradient(centerX, centerY, baseRadius - 10, centerX, centerY, baseRadius + 30 + volume * 40);
-        outerGlow.addColorStop(0, 'rgba(16, 185, 129, 0.15)');
-        outerGlow.addColorStop(0.5, 'rgba(16, 185, 129, 0.05)');
-        outerGlow.addColorStop(1, 'rgba(16, 185, 129, 0)');
+        outerGlow.addColorStop(0, 'rgba(255, 255, 255, 0.15)');
+        outerGlow.addColorStop(0.5, 'rgba(255, 255, 255, 0.05)');
+        outerGlow.addColorStop(1, 'rgba(255, 255, 255, 0)');
         ctx.fillStyle = outerGlow;
         ctx.beginPath();
         ctx.arc(centerX, centerY, baseRadius + 30 + volume * 40, 0, Math.PI * 2);
@@ -211,7 +223,7 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
       // Draw solid central circle background (sleek deep graphite)
       ctx.beginPath();
       ctx.arc(centerX, centerY, baseRadius, 0, Math.PI * 2);
-      ctx.fillStyle = '#1D2939'; // Sleek dark slate gray (graphite)
+      ctx.fillStyle = '#262626'; // Sleek dark slate gray (graphite)
       ctx.fill();
 
       // Draw rippling/distorted border/ring
@@ -221,7 +233,7 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
       if (volume > 0) {
         ctx.beginPath();
         ctx.lineWidth = 1.5;
-        ctx.strokeStyle = 'rgba(16, 185, 129, 0.35)';
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
         for (let i = 0; i <= points; i++) {
           const angle = (i / points) * Math.PI * 2;
           let r = baseRadius + 8;
@@ -242,11 +254,11 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
       // Primary rippling ring (always present, but distorting/pulsating when speaking, static when idle)
       ctx.beginPath();
       ctx.lineWidth = volume > 0 ? 3.5 : 2.5;
-      ctx.strokeStyle = volume > 0 ? 'rgba(16, 185, 129, 0.95)' : 'rgba(255, 255, 255, 0.65)';
+      ctx.strokeStyle = volume > 0 ? 'rgba(255, 255, 255, 0.95)' : 'rgba(255, 255, 255, 0.65)';
       
       // Add neon-like shadow to the primary stroke when speaking
       if (volume > 0) {
-        ctx.shadowColor = 'rgba(16, 185, 129, 0.8)';
+        ctx.shadowColor = 'rgba(255, 255, 255, 0.8)';
         ctx.shadowBlur = 10 + volume * 15;
       } else {
         ctx.shadowBlur = 0;
@@ -348,7 +360,8 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
         const response = await fetch(`/api/upload-video-chunk?interviewId=${interviewId}&chunkIndex=${item.sequence}`, {
           method: "POST",
           headers: { "Content-Type": "application/octet-stream" },
-          body: item.blob
+          body: item.blob,
+          signal: AbortSignal.timeout(15000),
         });
 
         if (!response.ok) {
@@ -372,7 +385,7 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
         console.log(`[Upload Queue] Sequence ${item.sequence} uploaded successfully. Response:`, result);
         uploadSuccess = true;
       } catch (err: any) {
-        const isNetworkError = err instanceof TypeError || (err.message && err.message.toLowerCase().includes("fetch"));
+        const isNetworkError = err instanceof TypeError || err.name === 'TimeoutError' || (err.message && err.message.toLowerCase().includes("fetch"));
         console.error(`[Upload Queue] Exception during chunk ${item.sequence} upload:`, err);
 
         if (isNetworkError && attempt < maxRetries) {
@@ -505,23 +518,24 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
       }
     }
 
-    if (markerDetected) {
-      console.log("[WS Live] AI conclusion marker matched! Waiting for AI closing audio to finish playing...");
-      const checkPlayback = setInterval(() => {
-        const isPlaying = audioPlayerRef.current?.isPlayingOrQueued() || false;
-        if (!isPlaying) {
-          clearInterval(checkPlayback);
-          console.log("AI closing audio finished playing");
-          
-          // Wait an additional short buffer of 4 to 7 seconds (let's use 5 seconds)
-          const bufferDelay = 5000; // 5 seconds
-          console.log(`Waiting for natural pause of ${bufferDelay / 1000} seconds...`);
-          setTimeout(() => {
-            console.log("Natural pause complete, ending interview");
+    if (markerDetected && !hasFinishedRef.current) {
+      const timing = interviewClockRef.current;
+      if (!timing || !getInterviewClock(timing.startedAt, timing.duration).isClosing) {
+        // A model-generated marker must never shorten the allotted session.
+        earlyConclusionRef.current = true;
+      } else if (!closingPlaybackRef.current) {
+        closingRequestedRef.current = true;
+        let quietSince = Date.now();
+        closingPlaybackRef.current = setInterval(() => {
+          if (audioPlayerRef.current?.isPlayingOrQueued()) {
+            quietSince = Date.now();
+          } else if (Date.now() - quietSince >= 1500) {
+            clearInterval(closingPlaybackRef.current!);
+            closingPlaybackRef.current = null;
             handleCompleteInterviewRef.current?.('ai_conclusion');
-          }, bufferDelay);
-        }
-      }, 500);
+          }
+        }, 250);
+      }
     }
   };
 
@@ -539,14 +553,19 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
 
   const handleCompleteInterview = async (trigger: 'button' | 'timer' | 'ai_conclusion' = 'button') => {
     console.log(`Interview ending — trigger: ${trigger}`);
-    if (isSubmittingRef.current) {
+    if (isSubmittingRef.current || (hasFinishedRef.current && !completionFailedRef.current)) {
       console.log("[LiveInterview] Already submitting, ignoring duplicate trigger:", trigger);
       return;
     }
     isSubmittingRef.current = true;
+    completionFailedRef.current = false;
+    setCompletionError(null);
+    hasFinishedRef.current = true;
+    if (closingPlaybackRef.current) {
+      clearInterval(closingPlaybackRef.current);
+      closingPlaybackRef.current = null;
+    }
     setIsSubmitting(true);
-
-    const hasRecording = hasRecordingRef.current;
 
     try {
       // 1. Save final sorted transcript array directly to Firestore
@@ -558,7 +577,12 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
 
       // 2. Stop webcam recording
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        try { mediaRecorderRef.current.stop(); } catch (e) {}
+        const recorder = mediaRecorderRef.current;
+        await new Promise<void>((resolve, reject) => {
+          recorder.addEventListener('stop', () => resolve(), { once: true });
+          recorder.addEventListener('error', () => reject(new Error('The recording could not be saved.')), { once: true });
+          try { recorder.stop(); } catch (error) { reject(error); }
+        });
       }
 
       // 3. Shut down connection lines
@@ -567,151 +591,25 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
       }
       try { audioPlayerRef.current?.clear(); } catch (e) {}
 
-      // Wait 600ms to ensure final recorder chunks are processed in ondataavailable
-      await new Promise((resolve) => setTimeout(resolve, 600));
-
       // Flush any remaining unsent recorded data
       flushAccumulatedChunks();
 
-      // 4. Update Firestore status to 'processing' immediately when the interview ends (and set recordingStatus if video is expected)
-      const updateData: any = {
-        status: 'processing'
-      };
-      if (hasRecording) {
-        updateData.recordingStatus = 'uploading';
-      }
-      await updateDoc(doc(db, 'interviews', interviewId), updateData);
-
-      // Show completion screen immediately so the candidate does not wait on assessment or finalize
+      // Transfer all recorded chunks before handing durable work to the server.
+      await waitForUploadQueueToDrain();
+      const response = await fetch('/api/finish-interview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ interviewId, hasRecording: hasRecordingRef.current,
+          totalChunks: nextSequenceNumberRef.current, transcript: transcriptRef.current }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Could not save the interview.');
       onInterviewFinished();
 
-      // Perform finalization tasks in the background so the response does not block the UI
-      if (hasRecording) {
-        (async () => {
-          try {
-            console.log("[Finalizing] Waiting for remaining progressive chunks to finish uploading in background...");
-            
-            // Wait for upload queue to completely drain, with a maximum timeout (safeguard) of 20 seconds
-            const drainTimeout = new Promise<void>((resolve) => setTimeout(() => {
-              console.warn("[Finalizing] Drain queue timed out (safeguard triggered)!");
-              resolve();
-            }, 20000));
-
-            await Promise.race([
-              waitForUploadQueueToDrain(),
-              drainTimeout
-            ]);
-
-            console.log("[Finalizing] All progressive chunks uploaded or timeout reached. Triggering backend finalize in background...");
-
-            // Call finalize video endpoint
-            const finalizeResponse = await fetch("/api/finalize-video", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ interviewId })
-            });
-
-            if (!finalizeResponse.ok) {
-              const errText = await finalizeResponse.text();
-              throw new Error(`Finalize video failed: ${errText}`);
-            }
-
-            console.log("[Finalizing] Finalize video uploaded and transcoded successfully.");
-          } catch (uploadErr) {
-            console.error("[Finalizing] Video finalize failed:", uploadErr);
-            try {
-              await updateDoc(doc(db, 'interviews', interviewId), {
-                recordingStatus: 'failed'
-              });
-            } catch (e) {}
-          }
-        })();
-      }
-
-      // Run the /api/assess trigger as an independent, non-blocking background task with retry logic
-      (async () => {
-        // Wait briefly to let preceding state changes settle
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-
-        const maxRetries = 3;
-        let attempt = 0;
-        let success = false;
-        let lastError: any = null;
-        let nextBackoffMs = 0;
-
-        while (attempt <= maxRetries && !success) {
-          try {
-            if (nextBackoffMs > 0) {
-              console.log(`[Background Assessment] Waiting ${nextBackoffMs}ms before assessment retry (Attempt ${attempt}/${maxRetries})...`);
-              await new Promise((resolve) => setTimeout(resolve, nextBackoffMs));
-            }
-
-            console.log(`[Background Assessment] Triggering backend AI assessment (Attempt ${attempt + 1}/${maxRetries + 1})...`);
-            const response = await fetch('/api/assess', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ interviewId })
-            });
-
-            if (!response.ok) {
-              if (response.status === 429) {
-                // Handle 429 rate limit backoff specifically
-                const retryAfterHeader = response.headers.get('Retry-After');
-                let customDelayMs = 0;
-                if (retryAfterHeader) {
-                  const parsedSeconds = parseInt(retryAfterHeader, 10);
-                  if (!isNaN(parsedSeconds) && parsedSeconds > 0) {
-                    customDelayMs = parsedSeconds * 1000;
-                    console.log(`[Background Assessment] Received 429 Rate Limit. 'Retry-After' header suggests waiting: ${parsedSeconds} seconds.`);
-                  }
-                }
-                if (customDelayMs === 0) {
-                  // Standard longer backoff schedule for 429: ~10s, 20s, 40s
-                  const nextAttemptNumber = attempt + 1;
-                  customDelayMs = nextAttemptNumber === 1 ? 10000 : nextAttemptNumber === 2 ? 20000 : 40000;
-                  console.log(`[Background Assessment] Received 429 Rate Limit. No valid 'Retry-After' header. Using 429 backoff schedule: ${customDelayMs}ms.`);
-                }
-                nextBackoffMs = customDelayMs;
-              } else {
-                // Non-429 standard transient error backoff: 2s, 4s, 8s
-                const nextAttemptNumber = attempt + 1;
-                nextBackoffMs = Math.pow(2, nextAttemptNumber) * 1000;
-                console.log(`[Background Assessment] Received error status ${response.status}. Using standard backoff: ${nextBackoffMs}ms.`);
-              }
-              throw new Error(`Assessment API returned non-ok status: ${response.status}`);
-            }
-
-            console.log("[Background Assessment] Backend AI assessment trigger completed successfully!");
-            success = true;
-          } catch (err: any) {
-            console.error(`[Background Assessment] Attempt ${attempt + 1} failed:`, err);
-            lastError = err;
-            attempt++;
-            if (!nextBackoffMs || nextBackoffMs === 0) {
-              nextBackoffMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s fallback
-            }
-          }
-        }
-
-        // If all retries are exhausted, update Firestore with status: 'completed' and assessmentStatus: 'failed'
-        if (!success) {
-          console.error(`[Background Assessment] CRITICAL: All AI assessment attempts failed after ${maxRetries} retries. Last error:`, lastError);
-          try {
-            console.log(`[Background Assessment] Setting interview ${interviewId} status to 'completed' and assessmentStatus to 'failed'...`);
-            await updateDoc(doc(db, 'interviews', interviewId), {
-              status: 'completed',
-              assessmentStatus: 'failed'
-            });
-            console.log("[Background Assessment] Successfully updated Firestore with failed assessment status.");
-          } catch (dbErr) {
-            console.error("[Background Assessment] Failed to update Firestore with failed assessment status:", dbErr);
-          }
-        }
-      })();
-
-    } catch (err) {
-      console.error("Error setting up processing state:", err);
-      onInterviewFinished();
+    } catch (err: any) {
+      console.error('Error handing interview to server:', err);
+      completionFailedRef.current = true;
+      setCompletionError(err.message || 'Could not save the interview. Please retry.');
     } finally {
       isSubmittingRef.current = false;
       setIsSubmitting(false);
@@ -723,6 +621,11 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
   useEffect(() => {
     let isAborted = false;
     let isSetupComplete = false;
+    let sessionRecorder: MediaRecorder | null = null;
+    setupCompleteRef.current = false;
+    closingRequestedRef.current = false;
+    earlyConclusionRef.current = false;
+    lastTimeNoticeRef.current = null;
 
     // Guard against dual connection attempts within the same session
     if (isConnectingRef.current || (wsRef.current && (wsRef.current.readyState === WebSocket.CONNECTING || wsRef.current.readyState === WebSocket.OPEN))) {
@@ -737,12 +640,10 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
       if (isAborted) return;
       if (docSnap.exists()) {
         const data = docSnap.data() as Interview;
-        setInterview(data);
-        const elapsedTimeSeconds = data.startedAt
-          ? Math.floor((Date.now() - data.startedAt) / 1000)
-          : 0;
-        const remainingSeconds = Math.max(0, (data.duration * 60) - elapsedTimeSeconds);
-        setTimeLeft(remainingSeconds);
+        const startedAt = data.startedAt || Date.now();
+        interviewClockRef.current = { startedAt, duration: data.duration };
+        setInterview({ ...data, startedAt });
+        setTimeLeft(getInterviewClock(startedAt, data.duration).remainingSeconds);
         const existingTranscript = data.transcript || [];
         transcriptRef.current = existingTranscript;
         setTranscript(existingTranscript);
@@ -788,6 +689,7 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
       });
 
       const recorder = new MediaRecorder(recordingStream, options);
+      sessionRecorder = recorder;
       recorder.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) {
           pendingChunksRef.current.push(e.data);
@@ -811,6 +713,7 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
         });
 
         const recorder = new MediaRecorder(recordingStream);
+        sessionRecorder = recorder;
         recorder.ondataavailable = (e) => {
           if (e.data && e.data.size > 0) {
             pendingChunksRef.current.push(e.data);
@@ -841,7 +744,7 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
 
     // 5. Connect to our secure WebSocket proxy of Gemini Live API
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/api/live`;
+    const wsUrl = `${protocol}//${window.location.host}/api/live?interviewId=${encodeURIComponent(interviewId)}`;
     console.log(`[WS Live] Connecting to proxy WebSocket: ${wsUrl}`);
     const socket = new WebSocket(wsUrl);
     wsRef.current = socket;
@@ -867,15 +770,7 @@ export default function LiveInterview({ interviewId, micStream, onInterviewFinis
         const existingTranscript = info.transcript || [];
         const isResuming = existingTranscript.length > 0;
 
-        // Calculate recommended question count within 2 to 4 range based on interview length/type
-        let targetQuestions = 3;
-        if (info.duration <= 5) {
-          targetQuestions = 2;
-        } else if (info.duration >= 15) {
-          targetQuestions = 4;
-        } else {
-          targetQuestions = info.interviewType === 'Technical' ? 3 : 4;
-        }
+        const remainingSeconds = getInterviewClock(info.startedAt || Date.now(), info.duration).remainingSeconds;
 
         let cvSection = "";
         if (info.cvText && info.cvText.trim()) {
@@ -901,7 +796,7 @@ ROLE CONTEXT:
 ${info.jobDescription}
 - Interview Style: ${info.interviewType} Interview
 - Target Duration: ${info.duration} minutes
-- Target Question Count: exactly ${targetQuestions} questions (from a strict range of 2 to 4 questions based on duration and interview type)
+- Time remaining now: ${remainingSeconds} seconds. The application will send updated time notices and a closing instruction.
 
 CONVERSATIONAL PACE & SPEAKING STYLE:
 - Note: There is no native speed or speaking rate parameter in the Gemini Multimodal Live API. Therefore, you must manage your speaking rate entirely through your style.
@@ -921,14 +816,18 @@ YOUR INTERVIEW FLOW:
 - Your first message must ONLY be the warm welcome and orientation (greeting, role, interview type, duration, response-length guidance). Do NOT ask your first interview question in this same message. End your first turn after the orientation, and wait for the candidate to respond (even a brief acknowledgment like 'okay' or 'I'm ready' is fine). Make sure this opening greeting feels settling, warm, and not rushed. Give the candidate a warm moment to settle and simply invite them to state when they are ready to begin.
 
 2. INTERVIEW STRUCTURE & TONE:
-- Ask exactly ${targetQuestions} questions in total during this interview session.
+- Interview for the available time. There is NO fixed or maximum question count.
+- Ask one relevant question at a time, listen to the answer, and use thoughtful follow-ups or new questions while time remains.
+- Adapt the depth and length of your questions to the remaining time. Do not rush to fit a question quota.
+- Never conclude because you have finished a prepared list of questions. Continue exploring relevant experience and role requirements until the application sends the closing instruction.
 - Maintain a warm, highly conversational, and human tone.
 - Avoid a rigid, mechanical "ask → wait → ask" cadence.
 - React briefly and naturally to what the candidate says before transitioning (e.g., "That makes sense," "Interesting approach to that problem," etc.) to demonstrate active listening, rather than jumping straight to the next question.
 ${cvSection}
 
 3. CLOSING & TERMINATING THE SESSION:
-- Once you have asked all ${targetQuestions} questions, or if you are informed that the time limit is reached, conclude the interview naturally.
+- Only enter the closing phase when the application sends a time notice explicitly instructing you to wrap up.
+- When that instruction arrives, finish the current exchange, avoid starting a new substantial question, and give a brief natural closing before the remaining seconds expire.
 - Give a warm parting remark, thank the candidate for their time, and explicitly state: "Our team will review your performance and will let you know of the next steps."
 - DO NOT say meta-phrases like "the interview is now ended", "interview ended", or "session complete". Simply give the warm closing remark and stop speaking.
 - CRITICAL - SILENT COMPLETION MARKER: At the very end of your final written output, output the text token [INTERVIEW_COMPLETE].
@@ -980,7 +879,7 @@ ${existingTranscript.map(t => `[${t.sender}]: ${t.text}`).join('\n')}
     };
 
     socket.onmessage = async (event) => {
-      if (isAborted) return;
+      if (isAborted || hasFinishedRef.current) return;
       try {
         const rawData = typeof event.data === 'string' ? event.data : await event.data.text();
         const msg = JSON.parse(rawData);
@@ -988,6 +887,12 @@ ${existingTranscript.map(t => `[${t.sender}]: ${t.text}`).join('\n')}
         // Handle Setup Complete
         if (msg.setupComplete) {
           isSetupComplete = true;
+          setupCompleteRef.current = true;
+          const timing = interviewClockRef.current;
+          if (timing && getInterviewClock(timing.startedAt, timing.duration).isClosing) {
+            // The clock effect will send the closing instruction for a late resume.
+            return;
+          }
           const isResuming = transcriptRef.current.length > 0;
           const seedMessageText = isResuming
             ? "The connection was lost and I have reconnected. Please resume the conversation exactly where we left off, taking into account the conversation history provided in your instructions."
@@ -1080,6 +985,18 @@ ${existingTranscript.map(t => `[${t.sender}]: ${t.text}`).join('\n')}
             activeAiEntryRef.current = null;
             activeCandidateEntryRef.current = null;
 
+            if (earlyConclusionRef.current && socket.readyState === WebSocket.OPEN) {
+              earlyConclusionRef.current = false;
+              const timing = interviewClockRef.current;
+              const clock = timing && getInterviewClock(timing.startedAt, timing.duration);
+              if (clock && !clock.isClosing) {
+                socket.send(JSON.stringify({ clientContent: {
+                  turns: [{ role: 'user', parts: [{ text: `[SYSTEM TIME NOTICE: ${clock.remainingSeconds} seconds remain. Continue the interview with a relevant question or follow-up. Do not conclude or emit the completion marker yet.]` }] }],
+                  turnComplete: true,
+                } }));
+              }
+            }
+
             // Sync the full ordered transcript array to Firestore
             await saveTranscriptToFirestore(transcriptRef.current);
           }
@@ -1164,7 +1081,7 @@ registerProcessor('mic-processor', MicProcessor);
         URL.revokeObjectURL(workletUrl);
 
         if (isAborted) {
-          try { micContext.close(); } catch (e) {}
+          closeAudioContext(micContext);
           return;
         }
 
@@ -1182,7 +1099,7 @@ registerProcessor('mic-processor', MicProcessor);
         micNode.port.onmessage = (e) => {
           if (isAborted) {
             try { micNode.disconnect(); } catch (_) {}
-            try { micContext.close(); } catch (_) {}
+            closeAudioContext(micContext);
             return;
           }
           if (micMutedRef.current) return;
@@ -1217,7 +1134,7 @@ registerProcessor('mic-processor', MicProcessor);
           micAudioContextRef.current = micContext;
 
           if (isAborted) {
-            try { micContext.close(); } catch (e) {}
+            closeAudioContext(micContext);
             return;
           }
 
@@ -1231,7 +1148,7 @@ registerProcessor('mic-processor', MicProcessor);
           micProcessor.onaudioprocess = (e) => {
             if (isAborted) {
               try { micProcessor.disconnect(); } catch (_) {}
-              try { micContext.close(); } catch (_) {}
+              closeAudioContext(micContext);
               return;
             }
             if (micMutedRef.current) return;
@@ -1273,6 +1190,16 @@ registerProcessor('mic-processor', MicProcessor);
     return () => {
       // Cleanups
       clearInterval(flushInterval);
+      // Each effect owns its recorder, including the development StrictMode pass.
+      if (sessionRecorder && sessionRecorder.state !== 'inactive') {
+        sessionRecorder.ondataavailable = null;
+        try { sessionRecorder.stop(); } catch (e) {}
+      }
+      setupCompleteRef.current = false;
+      if (closingPlaybackRef.current) {
+        clearInterval(closingPlaybackRef.current);
+        closingPlaybackRef.current = null;
+      }
       console.log("[WS Live] Cleaning up LiveInterview socket, audio players, and microphone stream connections...");
       isAborted = true;
       isConnectingRef.current = false;
@@ -1283,15 +1210,15 @@ registerProcessor('mic-processor', MicProcessor);
       try { audioPlayerRef.current?.clear(); } catch (e) {}
       try { micProcessorRef.current?.disconnect(); } catch (e) {}
       try { micWorkletNodeRef.current?.disconnect(); } catch (e) {}
-      try { micAudioContextRef.current?.close(); } catch (e) {}
-      try { sharedAudioCtx.close(); } catch (e) {}
+      closeAudioContext(micAudioContextRef.current);
+      closeAudioContext(sharedAudioCtx);
     };
   }, [interviewId, micStream]);
 
   // Silence and Over-Length checking loop
   useEffect(() => {
     const interval = setInterval(() => {
-      if (isSubmittingRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      if (hasFinishedRef.current || closingRequestedRef.current || !setupCompleteRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
         return;
       }
 
@@ -1359,17 +1286,38 @@ registerProcessor('mic-processor', MicProcessor);
     return () => clearInterval(interval);
   }, [interview]);
 
-  // Timer Countdown loop
+  // Use the saved deadline rather than counting interval ticks (tabs may sleep).
   useEffect(() => {
-    if (timeLeft <= 0) {
-      handleCompleteInterviewRef.current?.('timer');
-      return;
-    }
-    const timer = setInterval(() => {
-      setTimeLeft((prev) => prev - 1);
-    }, 1000);
+    if (!interview?.startedAt) return;
+    const tick = () => {
+      if (hasFinishedRef.current) return;
+      const clock = getInterviewClock(interview.startedAt!, interview.duration);
+      setTimeLeft(clock.remainingSeconds);
+      if (clock.isExpired) {
+        handleCompleteInterviewRef.current?.('timer');
+        return;
+      }
+      const socket = wsRef.current;
+      if (!setupCompleteRef.current || socket?.readyState !== WebSocket.OPEN) return;
+      const minute = Math.ceil(clock.remainingSeconds / 60);
+      let notice: string | null = null;
+      if (clock.isClosing && !closingRequestedRef.current) {
+        closingRequestedRef.current = true;
+        notice = `${clock.remainingSeconds} seconds remain. Wrap up now: acknowledge the current answer, ask no new substantial questions, thank the candidate warmly, and finish your closing before time expires. End with the silent [INTERVIEW_COMPLETE] marker.`;
+      } else if (!clock.isClosing && minute !== lastTimeNoticeRef.current) {
+        notice = `${clock.remainingSeconds} seconds remain. Continue interviewing with relevant questions and follow-ups. Do not conclude yet. Wait for the explicit wrap-up instruction.`;
+      }
+      lastTimeNoticeRef.current = minute;
+      if (notice) socket.send(JSON.stringify({ clientContent: {
+        turns: [{ role: 'user', parts: [{ text: `[SYSTEM TIME NOTICE: ${notice}]` }] }],
+        // Inform the model without asking it to interrupt an answer, except at closing.
+        turnComplete: clock.isClosing,
+      } }));
+    };
+    tick();
+    const timer = setInterval(tick, 1000);
     return () => clearInterval(timer);
-  }, [timeLeft]);
+  }, [interview]);
 
   const toggleMic = () => {
     setMicMuted(!micMuted);
@@ -1383,16 +1331,9 @@ registerProcessor('mic-processor', MicProcessor);
 
   const ratio = timeLeft / ((interview?.duration || 10) * 60);
   const elapsedRatio = 1 - ratio; // percentage of total time elapsed
-  const timerColorClass = elapsedRatio >= 0.80 
-    ? 'border-rose-500/30 bg-rose-500/5 text-rose-500 animate-pulse' 
-    : elapsedRatio >= 0.60 
-      ? 'border-amber-accent/30 bg-amber-accent/5 text-amber-accent' 
-      : 'border-emerald-accent/30 bg-emerald-accent/5 text-emerald-accent';
-  const timerIconClass = elapsedRatio >= 0.80 
-    ? 'text-rose-500' 
-    : elapsedRatio >= 0.60 
-      ? 'text-amber-accent' 
-      : 'text-emerald-accent';
+  const timerColorClass = elapsedRatio >= 0.80
+    ? 'border-white/50 bg-white/10 text-white animate-pulse'
+    : 'border-white/30 bg-white/5 text-white';
 
   return (
     <div className="min-h-screen bg-ink text-white flex flex-col font-sans" id="live-interview-canvas">
@@ -1408,13 +1349,13 @@ registerProcessor('mic-processor', MicProcessor);
         {/* Time and Finish Early Controls */}
         <div className="flex items-center gap-4">
           <div className={`flex items-center gap-1.5 border rounded-lg px-3 py-1.5 text-xs font-mono transition-all duration-300 ${timerColorClass}`}>
-            <Timer className={`h-4 w-4 shrink-0 ${timerIconClass}`} />
+            <Timer className="h-4 w-4 shrink-0 text-white" />
             <span>Time Budget: {formatTime(timeLeft)}</span>
           </div>
           <button
             onClick={() => handleCompleteInterview('button')}
             disabled={isSubmitting}
-            className="flex items-center gap-1.5 bg-rose-600 hover:bg-rose-500 disabled:bg-rose-800 text-white px-4 py-1.5 text-xs font-bold font-mono rounded-lg transition-colors cursor-pointer"
+            className="flex items-center gap-1.5 bg-neutral-600 hover:bg-neutral-500 disabled:bg-neutral-800 text-white px-4 py-1.5 text-xs font-bold font-mono rounded-lg transition-colors cursor-pointer"
           >
             <PhoneOff className="h-3.5 w-3.5" /> End Interview
           </button>
@@ -1422,14 +1363,18 @@ registerProcessor('mic-processor', MicProcessor);
       </div>
 
       {/* Main split screens panel */}
+      {completionError && <div role="alert" className="mx-6 mt-4 rounded-lg border border-white/30 bg-white/10 p-4 text-sm">
+        <p>{completionError} Your interview has stopped. Keep this window open and retry saving.</p>
+        <button onClick={() => handleCompleteInterview('button')} disabled={isSubmitting} className="mt-3 rounded-lg bg-white text-ink px-4 py-2 font-semibold cursor-pointer">Retry saving interview</button>
+      </div>}
       <div className="flex-1 grid grid-cols-1 md:grid-cols-2 p-6 gap-6">
         
         {/* Left Side: Animated AI Avatar */}
         <div className="bg-slate border border-graphite rounded-2xl flex flex-col items-center justify-center p-8 relative overflow-hidden min-h-[300px]">
           <div className="absolute top-4 left-4 flex items-center gap-2">
             <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-accent opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-accent"></span>
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-white"></span>
             </span>
             <span className="text-[10px] uppercase font-bold text-neutral-bg/50 tracking-wider font-mono">Session Active</span>
           </div>
@@ -1454,8 +1399,8 @@ registerProcessor('mic-processor', MicProcessor);
         <div className="bg-slate border border-graphite rounded-2xl relative overflow-hidden min-h-[300px] flex items-center justify-center">
           <div className="absolute top-4 left-4 flex items-center gap-2 z-20">
             <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-500 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-rose-500"></span>
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-neutral-500 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-neutral-500"></span>
             </span>
             <span className="text-[10px] uppercase font-bold text-neutral-bg/50 tracking-wider font-mono">Camera Recording</span>
           </div>
@@ -1481,7 +1426,7 @@ registerProcessor('mic-processor', MicProcessor);
               onClick={toggleMic}
               className={`p-3 rounded-full cursor-pointer transition-all duration-200 border ${
                 micMuted 
-                  ? 'bg-rose-600 border-rose-500 hover:bg-rose-500 text-white' 
+                  ? 'bg-neutral-600 border-neutral-500 hover:bg-neutral-500 text-white' 
                   : 'bg-graphite/90 border-slate hover:bg-slate text-neutral-bg shadow-lg'
               }`}
             >
@@ -1495,9 +1440,9 @@ registerProcessor('mic-processor', MicProcessor);
       {/* Overlay Submission loader */}
       {isSubmitting && (
         <div className="fixed inset-0 bg-ink/95 flex flex-col items-center justify-center z-50 p-4 space-y-4">
-          <div className="h-12 w-12 animate-spin rounded-full border-4 border-emerald-accent border-t-transparent" />
+          <div className="h-12 w-12 animate-spin rounded-full border-4 border-white border-t-transparent" />
           <div className="text-center">
-            <h2 className="text-base font-bold font-display text-white">Uploading webcam recording & compiling AI evaluation dossier...</h2>
+            <h2 className="text-base font-bold font-display text-white">Saving your interview...</h2>
             <p className="text-xs text-neutral-bg/40 mt-1 font-mono">Please keep this browser window open. Finalizing session data.</p>
           </div>
         </div>

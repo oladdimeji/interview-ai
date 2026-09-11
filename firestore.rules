@@ -20,6 +20,17 @@ service cloud.firestore {
       return resource.data;
     }
 
+    // Shared job library for the no-login WorkPodd test workspace.
+    match /jobs/{jobId} {
+      allow read: if true;
+      allow create, update: if isValidId(jobId)
+        && incoming().keys().hasOnly(['title', 'description', 'createdAt'])
+        && incoming().title is string && incoming().title.size() > 0 && incoming().title.size() <= 200
+        && incoming().description is string && incoming().description.size() > 0 && incoming().description.size() <= 10000
+        && incoming().createdAt is string && incoming().createdAt.size() <= 100;
+      allow delete: if isValidId(jobId);
+    }
+
     // Rules for Interviews
     match /interviews/{interviewId} {
       // Pillar 3 & 8: Access is allowed on read queries (gets and lists)
@@ -42,6 +53,10 @@ service cloud.firestore {
         && (
           // Action: Candidate starts interview
           (incoming().diff(existing()).affectedKeys().hasOnly(['status', 'startedAt'])
+            && (existing().status == 'pending' || existing().status == 'in_progress')
+            && existing().get('bookingStatus', 'confirmed') != 'cancelled'
+            && existing().get('scheduledAt', 0) <= request.time.toMillis()
+            && (!existing().get('cvRequired', false) || existing().get('cvStatus', 'pending') == 'ready')
             && incoming().status == 'in_progress'
             && incoming().startedAt is int)
           
@@ -52,13 +67,20 @@ service cloud.firestore {
           
           // Action: Candidate completes/finishes the session
           || (incoming().diff(existing()).affectedKeys().hasAny(['status', 'recordingStatus'])
-            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'recordingStatus'])
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'recordingStatus', 'transcript'])
+            && incoming().transcript is list && incoming().transcript.size() <= 1000
             && (incoming().status == 'processing' || incoming().status == 'completed')
             && (incoming().recordingStatus == 'uploading' || incoming().recordingStatus == 'ready' || incoming().recordingStatus == 'failed' || incoming().recordingStatus == 'local_only'))
           
           // Action: CV Text/Url server-side extraction
-          || (incoming().diff(existing()).affectedKeys().hasAny(['cvText', 'cvFileUrl'])
-            && incoming().diff(existing()).affectedKeys().hasOnly(['cvText', 'cvFileUrl']))
+          || (incoming().diff(existing()).affectedKeys().hasAny(['cvText', 'cvFileUrl', 'cvStatus'])
+            && incoming().diff(existing()).affectedKeys().hasOnly(['cvText', 'cvFileUrl', 'cvStatus']))
+
+          // Calendar updates before the interview starts.
+          || (existing().status == 'pending'
+            && incoming().diff(existing()).affectedKeys().hasOnly(['scheduledAt', 'bookingStatus'])
+            && incoming().scheduledAt is int
+            && (incoming().bookingStatus == 'confirmed' || incoming().bookingStatus == 'cancelled'))
 
           // Action: Server-side video upload progress update
           || (incoming().diff(existing()).affectedKeys().hasAny(['recordingUrl', 'recordingStatus'])

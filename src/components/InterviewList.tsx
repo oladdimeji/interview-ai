@@ -49,14 +49,14 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
     switch (status) {
       case 'completed':
         return (
-          <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-accent/10 px-2.5 py-1 text-xs font-semibold text-emerald-accent border border-emerald-accent/25">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-accent/10 px-2.5 py-1 text-xs font-semibold text-accent border border-accent/25">
             <CheckCircle2 className="h-3 w-3" /> Completed
           </span>
         );
       case 'processing':
         return (
-          <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-accent/10 px-2.5 py-1 text-xs font-semibold text-amber-accent border border-amber-accent/25 animate-pulse">
-            <svg className="animate-spin h-3 w-3 text-amber-accent" fill="none" viewBox="0 0 24 24">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-muted-accent/10 px-2.5 py-1 text-xs font-semibold text-muted-accent border border-muted-accent/25 animate-pulse">
+            <svg className="animate-spin h-3 w-3 text-muted-accent" fill="none" viewBox="0 0 24 24">
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
             </svg>
@@ -66,7 +66,7 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
       case 'in_progress':
         return (
           <span className="inline-flex items-center gap-1.5 rounded-full bg-slate px-2.5 py-1 text-xs font-semibold text-neutral-bg border border-graphite animate-pulse">
-            <Video className="h-3 w-3 text-emerald-accent" /> In Progress
+            <Video className="h-3 w-3 text-white" /> In Progress
           </span>
         );
       default:
@@ -104,7 +104,7 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
               onClick={() => setFilter(opt)}
               className={`rounded px-2.5 py-1.5 font-bold transition-all duration-200 cursor-pointer capitalize ${
                 filter === opt 
-                  ? 'bg-emerald-accent text-ink shadow-sm' 
+                  ? 'bg-accent text-white shadow-sm' 
                   : 'text-ink/60 hover:text-ink hover:bg-neutral-bg/40'
               }`}
             >
@@ -116,7 +116,7 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
 
       {loading ? (
         <div className="flex justify-center items-center py-12">
-          <div className="h-8 w-8 animate-spin rounded-full border-2 border-emerald-accent border-t-transparent" />
+          <div className="h-8 w-8 animate-spin rounded-full border-2 border-accent border-t-transparent" />
         </div>
       ) : filteredInterviews.length === 0 ? (
         <div className="text-center py-12 border border-dashed border-neutral-200 rounded-xl">
@@ -132,7 +132,7 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
                 onClick={() => onSelectInterview(interview)}
                 className={`flex items-center justify-between py-4 px-3 -mx-3 rounded-lg transition-all duration-200 cursor-pointer ${
                   isSelected 
-                    ? 'bg-emerald-accent/5 border border-emerald-accent/15 border-l-4 border-l-emerald-accent pl-4 shadow-sm' 
+                    ? 'bg-accent/5 border border-accent/15 border-l-4 border-l-accent pl-4 shadow-sm' 
                     : 'hover:bg-neutral-bg/30'
                 }`}
               >
@@ -149,7 +149,7 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
                     </p>
                     <div className="flex items-center gap-2 mt-1.5">
                       <span className="inline-flex items-center gap-1 text-[10px] text-ink/40 font-semibold font-mono uppercase tracking-wider">
-                        <Calendar className="h-3 w-3 text-emerald-accent" />
+                        <Calendar className="h-3 w-3 text-accent" />
                         {new Date(interview.createdAt).toLocaleDateString()}
                       </span>
                     </div>
@@ -164,11 +164,11 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
                       setDeletingId(interview.id);
                     }}
                     title="Delete Interview"
-                    className="p-1.5 text-ink/40 hover:text-amber-accent hover:bg-amber-accent/5 rounded-lg transition-colors cursor-pointer"
+                    className="p-1.5 text-ink/40 hover:text-muted-accent hover:bg-muted-accent/5 rounded-lg transition-colors cursor-pointer"
                   >
                     <Trash2 className="h-4 w-4" />
                   </button>
-                  <ChevronRight className={`h-5 w-5 text-ink/30 transition-transform ${isSelected ? 'translate-x-1 text-emerald-accent' : ''}`} />
+                  <ChevronRight className={`h-5 w-5 text-ink/30 transition-transform ${isSelected ? 'translate-x-1 text-accent' : ''}`} />
                 </div>
               </div>
             );
@@ -180,7 +180,7 @@ export default function InterviewList({ onSelectInterview, selectedInterviewId, 
         <div className="fixed inset-0 bg-ink/80 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in">
           <div className="bg-white rounded-xl shadow-2xl border border-neutral-200 p-6 max-w-md w-full animate-in fade-in zoom-in-95 duration-200">
             <div className="flex items-start gap-4">
-              <div className="h-10 w-10 rounded-full bg-amber-accent/10 text-amber-accent flex items-center justify-center shrink-0">
+              <div className="h-10 w-10 rounded-full bg-muted-accent/10 text-muted-accent flex items-center justify-center shrink-0">
                 <AlertTriangle className="h-5 w-5" />
               </div>
               <div>

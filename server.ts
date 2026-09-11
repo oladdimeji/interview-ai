@@ -6,7 +6,7 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import fs from "fs";
-import { doc, getDoc, updateDoc, deleteDoc, collection, addDoc } from "firebase/firestore";
+import { doc, getDoc, updateDoc, deleteDoc, collection, addDoc, runTransaction } from "firebase/firestore";
 import { db } from "./src/firebase.js";
 import { google } from "googleapis";
 import { exec } from "child_process";
@@ -14,6 +14,7 @@ import { promisify } from "util";
 import multer from "multer";
 import { Readable } from "stream";
 import { createRequire } from "module";
+import { assertInterviewCanStart, getBookingUrl, getDriveConnection, integrationsRouter, syncScheduledInterview } from './integrations.js';
 
 let pdf: any;
 let mammoth: any;
@@ -63,6 +64,7 @@ function isTransientDriveError(err: any): boolean {
   return false;
 }
 
+dotenv.config({ path: '.env.local' });
 dotenv.config();
 
 function safeClose(socket: WebSocket, code: number, reason?: string | Buffer) {
@@ -85,7 +87,30 @@ function safeClose(socket: WebSocket, code: number, reason?: string | Buffer) {
 }
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
+app.use('/api', integrationsRouter);
+
+app.get('/book/:token', async (req, res) => {
+  try { res.redirect(await getBookingUrl(req.params.token)); }
+  catch (error: any) { res.status(400).type('text').send(error.message); }
+});
+
+app.post('/api/interviews/:id/start', async (req, res) => {
+  try {
+    await assertInterviewCanStart(req.params.id);
+    const startedAt = await runTransaction(db, async transaction => {
+      const ref = doc(db, 'interviews', req.params.id);
+      const snapshot = await transaction.get(ref);
+      const interview = snapshot.data();
+      if (!interview || !['pending', 'in_progress'].includes(interview.status)) throw new Error('This interview is no longer available.');
+      if (interview.status === 'in_progress') return interview.startedAt;
+      const start = Date.now();
+      transaction.update(ref, { status: 'in_progress', startedAt: start });
+      return start;
+    });
+    res.json({ startedAt });
+  } catch (error: any) { res.status(403).json({ error: error.message }); }
+});
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: "/api/live" });
@@ -112,167 +137,52 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok", geminiConfigured: !!aiClient });
 });
 
-// AI Assessment Endpoint
-app.post("/api/assess", async (req, res) => {
-  const { interviewId } = req.body;
-  if (!interviewId) {
-    return res.status(400).json({ error: "interviewId is required" });
-  }
-
+async function assessInterview(interviewId: string) {
   const aiClient = getGeminiClient();
-  if (!aiClient) {
-    return res.status(500).json({ error: "Gemini API client is not configured" });
-  }
-
-  let interviewDataForLog: any = null;
-
-  try {
-    // 1. Fetch interview details from Firestore
-    const docRef = doc(db, "interviews", interviewId);
-    const docSnap = await getDoc(docRef);
-
-    if (!docSnap.exists()) {
-      return res.status(404).json({ error: "Interview not found" });
-    }
-
-    const interview = docSnap.data();
-    const transcript = interview.transcript || [];
-
-    interviewDataForLog = {
-      applicantName: interview.applicantName,
-      jobTitle: interview.jobTitle,
-      interviewType: interview.interviewType,
-      status: interview.status,
-      recordingStatus: interview.recordingStatus,
-      transcriptLength: transcript.length,
-      hasDescription: !!interview.jobDescription
+  if (!aiClient) throw new Error('Gemini API client is not configured');
+  const docRef = doc(db, 'interviews', interviewId);
+  const snapshot = await getDoc(docRef);
+  if (!snapshot.exists()) throw new Error('Interview not found');
+  const interview = snapshot.data();
+  const transcript = interview.transcript || [];
+  let assessment: any;
+  if (!transcript.length) {
+    assessment = {
+      summary: 'No interview conversation occurred.',
+      scoreBreakdown: [{ criteria: 'Engagement', score: 1, feedback: 'Candidate did not speak during the session.' }],
+      decision: 'no_hire', decisionReasoning: 'The candidate did not provide any answers during the session.',
     };
-
-    if (transcript.length === 0) {
-      // Handle empty transcript gracefully
-      const updateFields: any = {
-        status: "completed",
-        assessmentStatus: "ready",
-        summary: "No interview conversation occurred.",
-        scoreBreakdown: [
-          { criteria: "Engagement", score: 1, feedback: "Candidate did not speak during the session." }
-        ],
-        decision: "no_hire",
-        decisionReasoning: "The candidate joined the interview but did not provide any answers or speech."
-      };
-
-      await updateDoc(docRef, updateFields);
-      return res.json({ status: "completed_empty" });
-    }
-
-    // 2. Format transcript for Gemini
-    const transcriptText = transcript
-      .map((entry: any) => `[${entry.sender}]: ${entry.text}`)
-      .join("\n");
-
-    // 3. Create prompt for Gemini
-    const prompt = `
-You are an expert executive recruiter and talent assessor. Analyze the following interview for the role of "${interview.jobTitle}" (${interview.interviewType} Interview).
-
-Job Description:
-${interview.jobDescription}
-
-Interview Transcript:
-${transcriptText}
-
-Provide a comprehensive, professional, and objective analysis of the candidate's performance. You MUST return ONLY a JSON object matching the following structure:
-{
-  "summary": "A concise, high-level overview of the candidate's performance (2-3 sentences)",
-  "scoreBreakdown": [
-    {
-      "criteria": "Criterion Name (e.g., Communication Skills, Problem Solving, Technical Aptitude, Role Fit)",
-      "score": 8, // An integer between 1 and 10
-      "feedback": "Specific feedback detail for this criterion"
-    }
-  ],
-  "decision": "hire" or "no_hire",
-  "decisionReasoning": "Detailed, professional justification of the hire/no-hire decision based on evidence in the transcript."
-}
-`;
-
-    // 4. Generate Content
+  } else {
     const response = await aiClient.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-      },
+      model: 'gemini-3.5-flash',
+      contents: [
+        'You are an expert recruiter. Assess the interview objectively using evidence from the transcript.',
+        'Role: ' + interview.jobTitle + ' (' + interview.interviewType + ')',
+        'Job description: ' + interview.jobDescription,
+        'Transcript:', ...transcript.map((entry: any) => '[' + entry.sender + ']: ' + entry.text),
+        'Return JSON with summary (2-3 sentences), scoreBreakdown (array of { criteria, score: integer 1-10, feedback }), decision (hire or no_hire), and decisionReasoning (evidence-based explanation).',
+      ].join('\n'),
+      config: { responseMimeType: 'application/json' },
     });
-
-    const responseText = response.text;
-    if (!responseText) {
-      throw new Error("No response text from Gemini");
+    const text = (response.text || '').trim().replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '');
+    assessment = JSON.parse(text);
+    if (typeof assessment.summary !== 'string' || typeof assessment.decisionReasoning !== 'string' ||
+        !['hire', 'no_hire'].includes(assessment.decision) || !Array.isArray(assessment.scoreBreakdown) ||
+        !assessment.scoreBreakdown.length || assessment.scoreBreakdown.some((item: any) =>
+          typeof item.criteria !== 'string' || typeof item.feedback !== 'string' || !Number.isInteger(item.score) || item.score < 1 || item.score > 10)) {
+      throw new Error('The assessment response was incomplete.');
     }
-
-    let parsedText = responseText.trim();
-    // Clean up potential markdown code block backticks if present
-    if (parsedText.startsWith("```")) {
-      const match = parsedText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-      if (match && match[1]) {
-        parsedText = match[1].trim();
-      }
-    }
-
-    // Parse the JSON result
-    let assessment;
-    try {
-      assessment = JSON.parse(parsedText);
-    } catch (parseErr: any) {
-      console.error("[Server AI Assessment] JSON parsing failed. raw text length:", parsedText.length);
-      let position = -1;
-      const matchPos = parseErr.message?.match(/at position (\d+)/i);
-      if (matchPos && matchPos[1]) {
-        position = parseInt(matchPos[1], 10);
-      } else {
-        const matchPos2 = parseErr.message?.match(/position (\d+)/i);
-        if (matchPos2 && matchPos2[1]) {
-          position = parseInt(matchPos2[1], 10);
-        }
-      }
-
-      if (position >= 0 && position < parsedText.length) {
-        const start = Math.max(0, position - 100);
-        const end = Math.min(parsedText.length, position + 100);
-        const snippet = parsedText.slice(start, end);
-        const pointer = " ".repeat(position - start) + "^";
-        console.error(`[Server AI Assessment] Parse error around position ${position}:\n>>>\n${snippet}\n>>>\n${pointer}`);
-      } else {
-        console.error(`[Server AI Assessment] Complete raw response text:\n>>>\n${parsedText}\n>>>`);
-      }
-      throw parseErr;
-    }
-
-    // 5. Update interview document with assessment results
-    const updateFields: any = {
-      status: "completed",
-      assessmentStatus: "ready",
-      summary: assessment.summary,
-      scoreBreakdown: assessment.scoreBreakdown,
-      decision: assessment.decision,
-      decisionReasoning: assessment.decisionReasoning,
-    };
-
-    await updateDoc(docRef, updateFields);
-
-    res.json({ success: true, assessment });
-  } catch (error: any) {
-    console.error(`[Server AI Assessment] CRITICAL 500 ERROR for interview ${interviewId}:`, error);
-    if (error instanceof Error) {
-      console.error("[Server AI Assessment] Stack Trace:", error.stack);
-    }
-    console.error("[Server AI Assessment] Data available at time of failure:", JSON.stringify(interviewDataForLog || { interviewId }));
-
-    res.status(500).json({
-      error: error.message || "Failed to complete AI assessment",
-      details: error.stack || String(error),
-      availableData: interviewDataForLog
-    });
   }
+  await updateDoc(docRef, { status: 'completed', assessmentStatus: 'ready',
+    summary: assessment.summary, scoreBreakdown: assessment.scoreBreakdown,
+    decision: assessment.decision, decisionReasoning: assessment.decisionReasoning });
+  return assessment;
+}
+
+app.post('/api/assess', async (req, res) => {
+  if (!req.body.interviewId) return res.status(400).json({ error: 'interviewId is required' });
+  try { res.json({ success: true, assessment: await assessInterview(req.body.interviewId) }); }
+  catch (error: any) { res.status(500).json({ error: error.message || 'Assessment failed.' }); }
 });
 
 // Multer setup for handling CV upload
@@ -289,12 +199,12 @@ async function extractTextFromBuffer(buffer: Buffer, originalname: string, mimet
   const ext = path.extname(originalname).toLowerCase();
   
   let pdfParser = pdf;
-  if (typeof pdfParser !== 'function' && (pdfParser as any).default) {
+  if (typeof pdfParser !== 'function' && pdfParser?.default) {
     pdfParser = (pdfParser as any).default;
   }
 
   let mammothExtractor = mammoth;
-  if (!mammothExtractor.extractRawText && (mammothExtractor as any).default) {
+  if (!mammothExtractor?.extractRawText && mammothExtractor?.default) {
     mammothExtractor = (mammothExtractor as any).default;
   }
 
@@ -307,8 +217,10 @@ async function extractTextFromBuffer(buffer: Buffer, originalname: string, mimet
         text = data.text;
       } else if (pdfParser && typeof pdfParser.PDFParse === 'function') {
         const parserInstance = new pdfParser.PDFParse({ data: buffer });
-        const result = await parserInstance.getText();
-        text = result.text;
+        try {
+          const result = await parserInstance.getText();
+          text = result.text;
+        } finally { await parserInstance.destroy(); }
       } else {
         throw new Error("No suitable PDF parser found in the pdf-parse module.");
       }
@@ -333,87 +245,16 @@ async function extractTextFromBuffer(buffer: Buffer, originalname: string, mimet
 // Helper for uploading CV to Google Drive
 async function uploadCvToDrive(interviewId: string, fileBuffer: Buffer, fileName: string, mimeType: string): Promise<string | null> {
   try {
-    const serviceAccountKeyRaw = process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY;
-    const folderId = process.env.DRIVE_RECORDINGS_FOLDER_ID;
-
-    if (!serviceAccountKeyRaw) {
-      console.warn("[Server CV Upload] GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY environment variable is not defined — skipping CV Drive upload");
-      return null;
-    }
-    if (!folderId) {
-      console.warn("[Server CV Upload] DRIVE_RECORDINGS_FOLDER_ID environment variable is not defined — skipping CV Drive upload");
-      return null;
-    }
-
-    let credentials: any;
-    try {
-      credentials = JSON.parse(serviceAccountKeyRaw);
-    } catch (parseErr) {
-      console.error("[Server CV Upload] Failed to parse GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY JSON:", parseErr);
-      return null;
-    }
-
-    const auth = new google.auth.GoogleAuth({
-      credentials,
-      scopes: ["https://www.googleapis.com/auth/drive"],
-    });
-
-    const drive = google.drive({ version: "v3", auth });
-
-    const fileMetadata = {
-      name: `cvs/${fileName}`,
-      parents: [folderId],
-    };
-
-    const media = {
-      mimeType: mimeType,
-      body: Readable.from(fileBuffer),
-    };
-
-    console.log(`[Server CV Upload] Uploading CV file to Google Drive Shared Folder ID: ${folderId}, filename: cvs/${fileName}`);
-    const createResponse = await drive.files.create({
+    const { drive, folderId } = await getDriveConnection();
+    const uploaded = await drive.files.create({
       supportsAllDrives: true,
-      requestBody: fileMetadata,
-      media: media,
-      fields: "id",
+      requestBody: { name: fileName, parents: [folderId] },
+      media: { mimeType, body: Readable.from(fileBuffer) },
+      fields: 'id',
     });
-
-    const fileId = createResponse.data.id;
-    if (!fileId) {
-      console.warn("[Server CV Upload] Failed to get file ID from Drive files.create response for CV");
-      return null;
-    }
-
-    console.log(`[Server CV Upload] Successfully uploaded CV to Drive. File ID: ${fileId}`);
-
-    // Set domain-level permissions (same as recordings)
-    try {
-      console.log(`[Server CV Upload] Setting domain-level 'reader' permissions for workpodd.com on CV file: ${fileId}`);
-      await drive.permissions.create({
-        fileId: fileId,
-        supportsAllDrives: true,
-        requestBody: {
-          role: "reader",
-          type: "domain",
-          domain: "workpodd.com",
-        },
-      });
-    } catch (permErr: any) {
-      console.warn(`[Server CV Upload] Non-fatal: failed to set domain permissions on CV ${fileId}:`, permErr?.message || permErr);
-    }
-
-    const cvFileUrl = `https://drive.google.com/file/d/${fileId}/preview`;
-    console.log(`[Server CV Upload] Generated CV Drive preview URL: ${cvFileUrl}`);
-    return cvFileUrl;
-  } catch (err: any) {
-    const status = err.status || err.statusCode || err.response?.status;
-    console.error(`[Server CV Upload] Google Drive API upload error (status=${status}):`, err?.message || err);
-    if (status === 403) {
-      console.warn(`[Server CV Upload] Google Drive API returned 403 PERMISSION_DENIED (API disabled or permissions missing). Handled safely without failing creation.`);
-    }
-    if (err?.response?.data) {
-      console.error(`[Server CV Upload] Google API Error Response Data:`, JSON.stringify(err.response.data));
-    }
+    return uploaded.data.id ? 'https://drive.google.com/file/d/' + uploaded.data.id + '/preview' : null;
+  } catch (error: any) {
+    console.error('[CV Upload]', error.message);
     return null;
   }
 }
@@ -465,6 +306,27 @@ async function processCvAndDriveInBackground(interviewId: string, file: Express.
     }
   }
 }
+
+app.post('/api/invitations/:id/cv', upload.single('cv'), async (req, res) => {
+  try {
+    await syncScheduledInterview(req.params.id, true);
+    const ref = doc(db, 'interviews', req.params.id);
+    const snapshot = await getDoc(ref);
+    if (!snapshot.exists() || snapshot.data().status !== 'pending' || snapshot.data().bookingStatus !== 'confirmed') {
+      return res.status(409).json({ error: 'A confirmed, upcoming interview is required before uploading your CV.' });
+    }
+    const file = req.file;
+    if (!file || !['.pdf', '.docx'].includes(path.extname(file.originalname).toLowerCase())) {
+      return res.status(400).json({ error: 'Upload a PDF or DOCX CV (up to 10 MB).' });
+    }
+    const text = (await extractTextFromBuffer(file.buffer, file.originalname, file.mimetype))?.trim();
+    if (!text || text.length < 20) return res.status(422).json({ error: 'We could not read the text in this CV. Please upload a text-based PDF or DOCX file instead of a scanned image.' });
+    if (text.length > 100000) return res.status(422).json({ error: 'This document is too long. Please upload a shorter CV.' });
+    const cvFileUrl = await uploadCvToDrive(req.params.id, file.buffer, `${req.params.id}${path.extname(file.originalname).toLowerCase()}`, file.mimetype);
+    await updateDoc(ref, { cvText: text, cvFileUrl, cvStatus: 'ready' });
+    res.json({ success: true });
+  } catch (error: any) { res.status(400).json({ error: error.message || 'Could not process the CV. Please try again.' }); }
+});
 
 // POST /api/interviews - Create new interview with immediate response and background processing
 app.post(
@@ -561,18 +423,7 @@ app.delete("/api/interviews/:id", async (req, res) => {
     // 3. Delete from Google Drive if fileId was found
     if (fileIdToDeleted) {
       try {
-        const serviceAccountKeyRaw = process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY;
-        if (!serviceAccountKeyRaw) {
-          throw new Error("GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY is missing from environment variables");
-        }
-
-        const credentials = JSON.parse(serviceAccountKeyRaw);
-        const auth = new google.auth.GoogleAuth({
-          credentials,
-          scopes: ["https://www.googleapis.com/auth/drive"],
-        });
-
-        const drive = google.drive({ version: "v3", auth });
+        const { drive } = await getDriveConnection();
         console.log(`[Server Delete Interview] Deleting file from Google Drive: ${fileIdToDeleted}`);
         await drive.files.delete({
           fileId: fileIdToDeleted,
@@ -625,15 +476,15 @@ app.post("/api/upload-video-chunk", express.raw({ type: "*/*", limit: "15mb" }),
   const interviewId = req.query.interviewId as string;
   const chunkIndexStr = req.query.chunkIndex as string;
 
-  if (!interviewId) {
+  if (!interviewId || !/^[a-zA-Z0-9_-]{1,128}$/.test(interviewId)) {
     return res.status(400).json({ error: "interviewId query parameter is required" });
   }
   if (!chunkIndexStr) {
     return res.status(400).json({ error: "chunkIndex query parameter is required" });
   }
 
-  const chunkIndex = parseInt(chunkIndexStr, 10);
-  if (isNaN(chunkIndex)) {
+  const chunkIndex = Number(chunkIndexStr);
+  if (!Number.isSafeInteger(chunkIndex) || chunkIndex < 0) {
     return res.status(400).json({ error: "chunkIndex must be a valid integer" });
   }
 
@@ -708,6 +559,7 @@ app.post("/api/upload-video-chunk", express.raw({ type: "*/*", limit: "15mb" }),
 
 // Server-side Video Finalizer Helper Function (to be called by API or Safeguard check)
 async function finalizeVideo(interviewId: string): Promise<string> {
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(interviewId)) throw new Error('Invalid interview ID.');
   if (reassemblingInterviews.has(interviewId)) {
     console.log(`[Server Finalize] Finalization or reassembly already in progress for interview ${interviewId}`);
     return "";
@@ -802,23 +654,7 @@ async function finalizeVideo(interviewId: string): Promise<string> {
     console.log(`[Server Finalize] Starting Google Drive upload for interview: ${interviewId}`);
     let recordingUrl = "";
     try {
-      const serviceAccountKeyRaw = process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY;
-      const folderId = process.env.DRIVE_RECORDINGS_FOLDER_ID;
-
-      if (!serviceAccountKeyRaw) {
-        throw new Error("GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY environment variable is not defined");
-      }
-      if (!folderId) {
-        throw new Error("DRIVE_RECORDINGS_FOLDER_ID environment variable is not defined");
-      }
-
-      const credentials = JSON.parse(serviceAccountKeyRaw);
-      const auth = new google.auth.GoogleAuth({
-        credentials,
-        scopes: ["https://www.googleapis.com/auth/drive"],
-      });
-
-      const drive = google.drive({ version: "v3", auth });
+      const { drive, folderId } = await getDriveConnection();
 
       // 1. Create file in Google Drive Shared Folder with retry logic
       console.log(`[Server Finalize] Uploading file to Google Drive Shared Folder ID: ${folderId}`);
@@ -872,43 +708,7 @@ async function finalizeVideo(interviewId: string): Promise<string> {
         }
       }
 
-      // 2. Set domain-level permissions with retry logic
-      let permissionsAttempt = 0;
-      while (permissionsAttempt <= maxDriveRetries) {
-        try {
-          console.log(`[Server Finalize] Setting domain-level 'reader' permissions for workpodd.com on file: ${fileId} (Attempt ${permissionsAttempt + 1}/${maxDriveRetries + 1})`);
-          await drive.permissions.create({
-            fileId: fileId!,
-            supportsAllDrives: true,
-            requestBody: {
-              role: "reader",
-              type: "domain",
-              domain: "workpodd.com",
-            },
-          });
-
-          if (permissionsAttempt > 0) {
-            console.log(`[Server Finalize] Drive permissions.create succeeded on retry attempt ${permissionsAttempt}!`);
-          } else {
-            console.log(`[Server Finalize] Successfully configured permissions for workpodd.com`);
-          }
-          break; // Success
-        } catch (err: any) {
-          const isTransient = isTransientDriveError(err);
-          console.error(`[Server Finalize] Drive permissions.create Attempt ${permissionsAttempt + 1} failed (Transient? ${isTransient}). Error:`, err.message || err);
-
-          if (isTransient && permissionsAttempt < maxDriveRetries) {
-            permissionsAttempt++;
-            const backoffMs = Math.pow(2, permissionsAttempt) * 1000; // 2s, 4s, 8s
-            console.log(`[Server Finalize] Retrying Drive permissions.create in ${backoffMs}ms...`);
-            await new Promise((resolve) => setTimeout(resolve, backoffMs));
-          } else {
-            console.error(`[Server Finalize] Drive permissions.create permanently failed or retries exhausted.`);
-            throw err;
-          }
-        }
-      }
-
+      // Files inherit access from the connected account and its InterviewAI folder.
       recordingUrl = `https://drive.google.com/file/d/${fileId}/preview`;
       console.log(`[Server Finalize] Generated Drive preview URL: ${recordingUrl}`);
 
@@ -980,6 +780,51 @@ async function finalizeVideo(interviewId: string): Promise<string> {
     reassemblingInterviews.delete(interviewId);
   }
 }
+
+const processingInterviews = new Set<string>();
+app.post('/api/finish-interview', async (req, res) => {
+  const { interviewId, hasRecording, totalChunks, transcript } = req.body;
+  if (typeof interviewId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(interviewId) ||
+      !Number.isInteger(totalChunks) || totalChunks < 0 || typeof hasRecording !== 'boolean' ||
+      !Array.isArray(transcript) || transcript.length > 1000 || transcript.some((entry: any) =>
+        !entry || !['AI', 'Candidate'].includes(entry.sender) || typeof entry.text !== 'string' || !Number.isFinite(entry.timestamp))) {
+    return res.status(400).json({ error: 'Invalid interview completion data.' });
+  }
+  try {
+    const ref = doc(db, 'interviews', interviewId);
+    const snapshot = await getDoc(ref);
+    if (!snapshot.exists()) return res.status(404).json({ error: 'Interview not found.' });
+    if (processingInterviews.has(interviewId) || snapshot.data().status === 'completed') return res.json({ success: true });
+    if (!['in_progress', 'processing'].includes(snapshot.data().status)) return res.status(409).json({ error: 'This interview has not started.' });
+    processingInterviews.add(interviewId);
+    const recordingComplete = hasRecording && totalChunks > 0 && progressiveStates.get(interviewId)?.nextExpectedIndex === totalChunks;
+    await updateDoc(ref, { transcript, status: 'processing', recordingStatus: recordingComplete ? 'uploading' : 'failed' });
+    // Everything needed is now on the server; closing the candidate's tab is safe.
+    res.status(202).json({ success: true });
+    const record = async () => {
+      if (!recordingComplete) return;
+      try { await finalizeVideo(interviewId); }
+      catch (error) {
+        console.error('[Recording finalization]', error);
+        await updateDoc(ref, { recordingStatus: 'failed' });
+      }
+    };
+    const assess = async () => {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try { await assessInterview(interviewId); return; }
+        catch (error) {
+          console.error('[Assessment attempt]', attempt + 1, error);
+          if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 2000 * 2 ** attempt));
+        }
+      }
+      await updateDoc(ref, { status: 'completed', assessmentStatus: 'failed' });
+    };
+    Promise.allSettled([record(), assess()]).finally(() => processingInterviews.delete(interviewId));
+  } catch (error: any) {
+    processingInterviews.delete(interviewId);
+    if (!res.headersSent) res.status(500).json({ error: error.message || 'Could not save the interview.' });
+  }
+});
 
 // Server-side Finalize Video Endpoint
 app.post("/api/finalize-video", express.json(), async (req, res) => {
@@ -1124,11 +969,24 @@ setInterval(async () => {
 }, 15 * 1000);
 
 // WebSocket proxy logic
-wss.on("connection", (ws, request) => {
+wss.on("connection", async (ws, request) => {
+  ws.pause();
+  try {
+    const id = new URL(request.url || "", "http://localhost").searchParams.get("interviewId");
+    if (!id) throw new Error("Interview ID is required");
+    const interview = await assertInterviewCanStart(id);
+    if (interview.status !== "in_progress") throw new Error("Start the interview from the waiting room first.");
+    if (ws.readyState !== WebSocket.OPEN) return;
+  } catch (error: any) {
+    ws.resume();
+    safeClose(ws, 1008, "Interview is not available. Return to the waiting room.");
+    return;
+  }
   const sessionId = Math.random().toString(36).substring(2, 10).toUpperCase();
   console.log(`[Proxy Server] [Session ${sessionId}] Client connected to Live proxy WebSocket successfully!`);
 
   if (!apiKey) {
+    ws.resume();
     console.error(`[Proxy Server] [Session ${sessionId}] GEMINI_API_KEY is not defined in env variables`);
     safeClose(ws, 1011, "Server Gemini API key missing");
     return;
@@ -1228,6 +1086,7 @@ wss.on("connection", (ws, request) => {
     console.error(`[Proxy Server] [Session ${sessionId}] Frontend Client WS error:`, error);
     safeClose(geminiWs, 1011, "Frontend Client connection error");
   });
+  ws.resume();
 });
 
 // Explicit 404 handler for unmatched /api routes so they NEVER fall through to HTML / Vite SPA fallback

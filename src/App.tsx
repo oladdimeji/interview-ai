@@ -10,20 +10,24 @@ import InterviewDetail from './components/InterviewDetail';
 import WaitingRoom from './components/WaitingRoom';
 import LiveInterview from './components/LiveInterview';
 import InterviewComplete from './components/InterviewComplete';
+import Jobs from './components/Jobs';
+import DriveConnection from './components/DriveConnection';
+import ScheduledInterview from './components/ScheduledInterview';
 
-import { Bot, Sparkles } from 'lucide-react';
+import { Bot, Briefcase, Sparkles } from 'lucide-react';
 
 export default function App() {
   const [route, setRoute] = useState<{ path: 'admin' | 'candidate'; interviewId?: string }>({ path: 'admin' });
 
   // Admin dashboard state
-  const [adminView, setAdminView] = useState<'dashboard' | 'create'>('dashboard');
+  const [adminView, setAdminView] = useState<'dashboard' | 'create' | 'jobs'>('dashboard');
   const [selectedInterview, setSelectedInterview] = useState<Interview | null>(null);
   const [listRefreshKey, setListRefreshKey] = useState(0);
 
   // Candidate experience state
   const [candidateStep, setCandidateStep] = useState<'waiting_room' | 'live_interview' | 'complete'>('waiting_room');
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
+  const [scheduledReady, setScheduledReady] = useState<string | null>(null);
 
   // URL Popstate Router
   useEffect(() => {
@@ -49,6 +53,10 @@ export default function App() {
   // Fetch interview document FIRST and check its "status" on candidate page load
   useEffect(() => {
     if (route.path !== 'candidate' || !route.interviewId) {
+      setLoadingCandidateStatus(false);
+      return;
+    }
+    if (route.interviewId.startsWith('inv_') && scheduledReady !== route.interviewId) {
       setLoadingCandidateStatus(false);
       return;
     }
@@ -94,7 +102,7 @@ export default function App() {
     };
 
     checkStatus();
-  }, [route.path, route.interviewId]);
+  }, [route.path, route.interviewId, scheduledReady]);
 
   // Reset candidate flow step and clean up mic/camera streams when returning to admin or switching interviews
   useEffect(() => {
@@ -113,19 +121,22 @@ export default function App() {
 
   // --- CANDIDATE SCREEN ROUTING ---
   if (route.path === 'candidate' && route.interviewId) {
+    if (route.interviewId.startsWith('inv_') && scheduledReady !== route.interviewId) {
+      return <ScheduledInterview interviewId={route.interviewId} onReady={() => setScheduledReady(route.interviewId!)} />;
+    }
     if (loadingCandidateStatus) {
       return (
-        <div className="flex min-h-screen items-center justify-center bg-[#F8FAFC]">
+        <div className="flex min-h-screen items-center justify-center bg-[#FAFAFA]">
           <div className="flex flex-col items-center space-y-4">
-            <div className="h-8 w-8 animate-spin rounded-full border-2 border-indigo-600 border-t-transparent" />
-            <p className="text-xs font-semibold text-slate-500">Checking interview status...</p>
+            <div className="h-8 w-8 animate-spin rounded-full border-2 border-neutral-600 border-t-transparent" />
+            <p className="text-xs font-semibold text-neutral-500">Checking interview status...</p>
           </div>
         </div>
       );
     }
 
     return (
-      <div className="min-h-screen bg-gray-50">
+      <div className="min-h-screen bg-neutral-50">
         {candidateStep === 'waiting_room' && (
           <WaitingRoom
             interviewId={route.interviewId}
@@ -137,22 +148,22 @@ export default function App() {
         )}
 
         {candidateStep === 'live_interview' && !micStream && (
-          <div className="min-h-screen bg-[#F8FAFC] flex items-center justify-center p-4 font-sans">
-            <div className="w-full max-w-md bg-white p-8 rounded-xl shadow-sm border border-slate-200 text-center space-y-6">
-              <div className="inline-flex h-12 w-12 items-center justify-center rounded-lg bg-indigo-50 text-indigo-600 animate-pulse">
+          <div className="min-h-screen bg-[#FAFAFA] flex items-center justify-center p-4 font-sans">
+            <div className="w-full max-w-md bg-white p-8 rounded-xl shadow-sm border border-neutral-200 text-center space-y-6">
+              <div className="inline-flex h-12 w-12 items-center justify-center rounded-lg bg-neutral-50 text-neutral-600 animate-pulse">
                 <svg className="w-6 h-6 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 15H19" />
                 </svg>
               </div>
               <div className="space-y-2">
-                <h2 className="font-display text-xl font-bold text-slate-900">Resuming Live Session</h2>
-                <p className="text-xs text-slate-500 max-w-sm mx-auto leading-relaxed">
+                <h2 className="font-display text-xl font-bold text-neutral-900">Resuming Live Session</h2>
+                <p className="text-xs text-neutral-500 max-w-sm mx-auto leading-relaxed">
                   You have an active interview session in progress. Please enable your microphone and camera to resume the live conversation.
                 </p>
               </div>
               
               {resumePermissionError && (
-                <div className="rounded-lg bg-rose-50 p-4 text-xs text-rose-600 border border-rose-100 text-left">
+                <div className="rounded-lg bg-neutral-50 p-4 text-xs text-neutral-600 border border-neutral-100 text-left">
                   {resumePermissionError}
                 </div>
               )}
@@ -171,7 +182,7 @@ export default function App() {
                     setResumePermissionError("Failed to obtain device permissions. Please ensure camera and microphone access are allowed in your browser settings.");
                   }
                 }}
-                className="w-full flex items-center justify-center gap-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-3 text-sm font-semibold transition-colors cursor-pointer"
+                className="w-full flex items-center justify-center gap-2 rounded-lg bg-neutral-600 hover:bg-neutral-700 text-white px-4 py-3 text-sm font-semibold transition-colors cursor-pointer"
               >
                 Enable Camera & Microphone
               </button>
@@ -205,7 +216,7 @@ export default function App() {
       {/* Sidebar Navigation */}
       <aside className="w-full lg:w-64 bg-ink text-neutral-bg flex flex-col shrink-0 border-b border-graphite lg:border-none shadow-xl z-10">
         <div className="p-6 flex items-center space-x-3 border-b border-graphite">
-          <div className="w-9 h-9 bg-emerald-accent rounded-lg flex items-center justify-center text-ink shadow-[0_0_12px_rgba(16,185,129,0.3)]">
+          <div className="w-9 h-9 bg-white rounded-lg flex items-center justify-center text-ink shadow-sm">
             <span className="text-xl font-bold font-display">I</span>
           </div>
           <div>
@@ -221,7 +232,7 @@ export default function App() {
             }}
             className={`w-full flex items-center space-x-3 p-3 rounded-lg transition-all duration-200 cursor-pointer text-left ${
               adminView === 'dashboard' && !selectedInterview
-                ? 'bg-emerald-accent text-ink font-semibold shadow-lg shadow-emerald-accent/20' 
+                ? 'bg-white text-ink font-semibold shadow-lg shadow-accent/20' 
                 : 'text-neutral-bg/70 hover:bg-slate/50 hover:text-white'
             }`}
           >
@@ -238,7 +249,7 @@ export default function App() {
             }}
             className={`w-full flex items-center space-x-3 p-3 rounded-lg transition-all duration-200 cursor-pointer text-left ${
               adminView === 'create'
-                ? 'bg-emerald-accent text-ink font-semibold shadow-lg shadow-emerald-accent/20' 
+                ? 'bg-white text-ink font-semibold shadow-lg shadow-accent/20' 
                 : 'text-neutral-bg/70 hover:bg-slate/50 hover:text-white'
             }`}
           >
@@ -247,16 +258,23 @@ export default function App() {
             </svg>
             <span className="text-sm">Create New</span>
           </button>
+          <button
+            onClick={() => { setSelectedInterview(null); setAdminView('jobs'); }}
+            className={`w-full flex items-center space-x-3 p-3 rounded-lg transition-colors cursor-pointer text-left ${adminView === 'jobs' ? 'bg-white text-ink font-semibold' : 'text-neutral-bg/70 hover:bg-slate/50 hover:text-white'}`}
+          >
+            <Briefcase className="w-5 h-5" />
+            <span className="text-sm">Jobs</span>
+          </button>
         </nav>
 
         <div className="p-6 border-t border-graphite bg-slate/30 flex items-center justify-between gap-2">
           <div className="flex items-center space-x-3 min-w-0">
-            <div className="w-9 h-9 rounded-full bg-slate border border-graphite shrink-0 flex items-center justify-center text-emerald-accent font-bold uppercase font-display text-xs">
+            <div className="w-9 h-9 rounded-full bg-slate border border-graphite shrink-0 flex items-center justify-center text-white font-bold uppercase font-display text-xs">
               RC
             </div>
             <div className="min-w-0">
               <div className="text-xs font-semibold truncate text-white">Recruiter Console</div>
-              <div className="text-[10px] text-emerald-accent/80 font-mono">Active</div>
+              <div className="text-[10px] text-white/80 font-mono">Active</div>
             </div>
           </div>
         </div>
@@ -272,13 +290,13 @@ export default function App() {
                 setAdminView('dashboard');
                 setSelectedInterview(null);
               }}
-              className="hover:text-emerald-accent transition-colors cursor-pointer font-semibold"
+              className="hover:text-accent transition-colors cursor-pointer font-semibold"
             >
               Interviews
             </button>
             <span className="text-neutral-bg/50">/</span>
             <span className="text-ink truncate font-semibold">
-              {selectedInterview ? selectedInterview.applicantName : adminView === 'create' ? 'Create New' : 'Dashboard'}
+              {selectedInterview ? selectedInterview.applicantName : adminView === 'create' ? 'Create New' : adminView === 'jobs' ? 'Jobs' : 'Dashboard'}
             </span>
           </div>
           <div className="flex space-x-3 shrink-0">
@@ -292,7 +310,7 @@ export default function App() {
                 }}
                 className="px-4 py-2 bg-slate text-neutral-bg text-xs border border-graphite rounded-lg font-semibold hover:bg-ink transition-colors duration-200 cursor-pointer shadow-sm flex items-center gap-1.5"
               >
-                <Sparkles className="w-3.5 h-3.5 text-emerald-accent" />
+                <Sparkles className="w-3.5 h-3.5 text-white" />
                 Copy Share Link
               </button>
             )}
@@ -301,7 +319,7 @@ export default function App() {
 
         {/* Scrollable Layout Content */}
         <div className="flex-1 p-6 sm:p-8 overflow-y-auto bg-neutral-bg">
-          {adminView === 'create' ? (
+          {adminView === 'jobs' ? <Jobs /> : adminView === 'create' ? (
             <div className="max-w-3xl mx-auto">
               <CreateInterview 
                 onInterviewCreated={() => {
@@ -314,6 +332,7 @@ export default function App() {
             <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
               {/* Left column: Interview Directory */}
               <div className="lg:col-span-5 space-y-6">
+                <DriveConnection />
                 <InterviewList
                   key={listRefreshKey}
                   onSelectInterview={(selected) => setSelectedInterview(selected)}
@@ -331,7 +350,7 @@ export default function App() {
                   />
                 ) : (
                   <div className="bg-white rounded-xl border border-neutral-bg/20 p-12 shadow-sm text-center min-h-[400px] flex flex-col justify-center items-center space-y-4">
-                    <div className="h-16 w-16 bg-emerald-accent/10 rounded-2xl flex items-center justify-center text-emerald-accent shadow-sm">
+                    <div className="h-16 w-16 bg-accent/10 rounded-2xl flex items-center justify-center text-accent shadow-sm">
                       <Bot className="h-8 w-8" />
                     </div>
                     <div className="space-y-1.5 max-w-sm">

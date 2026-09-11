@@ -30,4 +30,8 @@ export interface Interview {
   decisionReasoning?: string;
   cvText?: string | null;
   cvFileUrl?: string | null;
+  scheduledAt?: number;
+  bookingStatus?: 'confirmed' | 'cancelled';
+  cvRequired?: boolean;
+  cvStatus?: 'pending' | 'ready';
 }

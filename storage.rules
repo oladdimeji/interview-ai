@@ -1,8 +1,10 @@
 rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
+    // Recordings and CVs are stored in each company's connected Google Drive,
+    // not Firebase Storage. This bucket is unused; keep it closed.
     match /{allPaths=**} {
-      allow read, write: if true;
+      allow read, write: if false;
     }
   }
 }

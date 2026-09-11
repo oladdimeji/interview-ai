@@ -6,18 +6,18 @@
   --font-display: "Space Grotesk", sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
   
-  --color-ink: #0B0D10;
-  --color-slate: #1C212A;
-  --color-graphite: #262C36;
-  --color-emerald-accent: #10B981;
-  --color-amber-accent: #FFB020;
-  --color-neutral-bg: #F2F4F7;
+  --color-ink: #111111;
+  --color-slate: #1C1C1C;
+  --color-graphite: #303030;
+  --color-accent: #171717;
+  --color-muted-accent: #525252;
+  --color-neutral-bg: #F5F5F5;
 }
 
 body {
   font-family: var(--font-sans);
-  background-color: #F2F4F7;
-  color: #0B0D10;
+  background-color: #F5F5F5;
+  color: #111111;
 }
 
 .font-display {
@@ -32,39 +32,39 @@ body {
 @keyframes pulse-ring {
   0% {
     transform: scale(0.95);
-    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+    box-shadow: 0 0 0 0 rgba(23, 23, 23, 0.7);
   }
   70% {
     transform: scale(1);
-    box-shadow: 0 0 0 15px rgba(16, 185, 129, 0);
+    box-shadow: 0 0 0 15px rgba(23, 23, 23, 0);
   }
   100% {
     transform: scale(0.95);
-    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+    box-shadow: 0 0 0 0 rgba(23, 23, 23, 0);
   }
 }
 
-.pulse-emerald {
+.pulse-active {
   animation: pulse-ring 2s infinite;
 }
 
-@keyframes pulse-amber {
+@keyframes pulse-muted {
   0% {
     transform: scale(0.95);
-    box-shadow: 0 0 0 0 rgba(255, 176, 32, 0.7);
+    box-shadow: 0 0 0 0 rgba(82, 82, 82, 0.7);
   }
   70% {
     transform: scale(1);
-    box-shadow: 0 0 0 15px rgba(255, 176, 32, 0);
+    box-shadow: 0 0 0 15px rgba(82, 82, 82, 0);
   }
   100% {
     transform: scale(0.95);
-    box-shadow: 0 0 0 0 rgba(255, 176, 32, 0);
+    box-shadow: 0 0 0 0 rgba(82, 82, 82, 0);
   }
 }
 
-.pulse-amber {
-  animation: pulse-amber 2s infinite;
+.pulse-muted {
+  animation: pulse-muted 2s infinite;
 }
 
 /* Waveform animations */
