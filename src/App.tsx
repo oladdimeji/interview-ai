@@ -321,12 +321,7 @@ export default function App() {
         <div className="flex-1 p-6 sm:p-8 overflow-y-auto bg-neutral-bg">
           {adminView === 'jobs' ? <Jobs /> : adminView === 'create' ? (
             <div className="max-w-3xl mx-auto">
-              <CreateInterview 
-                onInterviewCreated={() => {
-                  refreshInterviewList();
-                  setAdminView('dashboard');
-                }} 
-              />
+              <CreateInterview onInterviewCreated={refreshInterviewList} />
             </div>
           ) : (
             <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">

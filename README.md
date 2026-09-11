@@ -58,7 +58,7 @@ outside the project and all public/static directories.
 2. Configure a verified sender in Brevo and set `BREVO_API_KEY` and `EMAIL_FROM`
    (for example, `InterviewAI <interviews@your-verified-domain>`).
 3. Set `APP_URL` to the actual app URL, including `https://`. This is used for
-   email links and Cal.com's interview location and success redirect.
+   email links and Cal.com's interview location link.
 4. Apply the updated `firestore.rules` to the **named database** configured in
    `src/firebase.ts`, including the new Jobs rules. A rule update against only
    the default database will not update this app's database.
@@ -72,9 +72,11 @@ visible to the owner in Cal.com's settings and can be cleaned up after testing.
 Opening an invitation refreshes its job choices from the Jobs page. Once a
 booking is confirmed, the selected job description is saved on the interview.
 
-Candidates book on **Cal.com itself**, enter their name, and choose a job. Cal.com
-then redirects them to InterviewAI to upload their CV. The app checks the booking
-through Cal.com's API; it does not trust dates or job titles in redirect query
+Candidates book on **Cal.com itself**, enter their name, and choose a job. Cal.com's
+confirmation page shows the InterviewAI link as the event location; candidates click
+it to upload their CV (automatic redirect requires Cal.com's paid Team plan, so this
+works on every plan). The app checks the booking through Cal.com's API; it does not
+trust dates or job titles in redirect query
 parameters. A readable CV is required before a scheduled interview can start.
 Scanned/image-only PDFs show a retry message. CV extraction completes before the
 interview becomes ready, using the same `cvText` field as manual interviews.

@@ -107,7 +107,7 @@ async function currentJobs() {
 function bookingFields(jobs: Invitation['jobs'], email: string) {
   return [
     { field: 'name', variant: 'fullName' },
-    { field: 'email', disableOnPrefill: true, requireEmails: [email] },
+    { field: 'email', required: true, disableOnPrefill: true, requireEmails: [email] },
     { field: 'custom', type: 'select', slug: 'job-title', label: 'Job title', required: true, options: [...new Set(jobs.map(job => job.title))] },
   ];
 }
@@ -241,8 +241,10 @@ integrationsRouter.post('/invitations', async (req, res) => {
           title: 'WorkPodd interview', slug: token.replace('_', '-'), lengthInMinutes: duration,
           hidden: true, bookingRequiresAuthentication: false, disableGuests: true,
           minimumBookingNotice: 5, confirmationPolicy: { disabled: true },
+          // successRedirectUrl (automatic post-booking redirect) requires a Cal.com
+          // Team plan; the location link below is shown on Cal.com's own
+          // confirmation page and works on every plan.
           locations: [{ type: 'link', link: `${origin}/interview/${token}`, public: true }],
-          successRedirectUrl: `${origin}/interview/${token}`,
           bookingFields: bookingFields(jobs, email),
           ...(process.env.CAL_SCHEDULE_ID ? { scheduleId: Number(process.env.CAL_SCHEDULE_ID) } : {}),
         });
