@@ -38,15 +38,31 @@ export default function CreateInterview({ onInterviewCreated }: CreateInterviewP
       console.log('[CreateInterview] Sending creation request to server...');
       const res = await fetch('/api/interviews', {
         method: 'POST',
+        headers: {
+          'Accept': 'application/json',
+        },
         body: formData,
       });
 
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({ error: 'Unknown server error' }));
-        throw new Error(errData.error || 'Failed to create interview');
+      const contentType = res.headers.get('content-type') || '';
+      let data: any = null;
+      if (contentType.includes('application/json')) {
+        try {
+          data = await res.json();
+        } catch {
+          data = null;
+        }
       }
 
-      const data = await res.json();
+      if (!res.ok) {
+        const errorMsg = data?.error || (data ? JSON.stringify(data) : `Server error (${res.status})`);
+        throw new Error(errorMsg);
+      }
+
+      if (!data || !data.interviewId) {
+        throw new Error('Invalid response received from server. Missing interviewId.');
+      }
+
       const interviewId = data.interviewId;
 
       // 2. Generate sharing link

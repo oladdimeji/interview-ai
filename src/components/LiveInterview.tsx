@@ -929,9 +929,10 @@ ${cvSection}
 
 3. CLOSING & TERMINATING THE SESSION:
 - Once you have asked all ${targetQuestions} questions, or if you are informed that the time limit is reached, conclude the interview naturally.
-- Give a warm parting remark, thank the candidate for their time, and let them know the team will review the full dossier.
-- CRITICAL - COMPLETION SIGNAL: After your final spoken parting remarks, you MUST append the exact literal marker [INTERVIEW_COMPLETE] at the very end of your final response text.
-- Do NOT speak the marker [INTERVIEW_COMPLETE] aloud, do not spell it out, do not paraphrase it, and do not describe it. It is a silent, machine-readable signal only.
+- Give a warm parting remark, thank the candidate for their time, and explicitly state: "Our team will review your performance and will let you know of the next steps."
+- DO NOT say meta-phrases like "the interview is now ended", "interview ended", or "session complete". Simply give the warm closing remark and stop speaking.
+- CRITICAL - SILENT COMPLETION MARKER: At the very end of your final written output, output the text token [INTERVIEW_COMPLETE].
+- ABSOLUTE MUST: DO NOT READ OR SPEAK THE WORDS "[INTERVIEW_COMPLETE]" ALOUD. Your final spoken word MUST be the end of your parting remark. The token [INTERVIEW_COMPLETE] must only exist in text for system parsing.
 `;
 
         if (isResuming) {
@@ -1489,26 +1490,6 @@ registerProcessor('mic-processor', MicProcessor);
           </div>
         </div>
 
-      </div>
-
-      {/* Real-time Subtitles / Dialog Log */}
-      <div className="border-t border-graphite px-6 py-4 bg-slate max-h-48 overflow-y-auto">
-        <span className="text-[10px] uppercase tracking-wider font-bold text-neutral-bg/40 block mb-2 font-mono">
-          Live Session Dialogue Log (Capturing...)
-        </span>
-        <div className="space-y-2">
-          {transcript.slice(-2).map((item, index) => (
-            <div key={index} className="flex gap-2 items-start text-xs leading-relaxed animate-fade-in font-mono">
-              <span className={`font-bold shrink-0 ${item.sender === 'AI' ? 'text-emerald-accent' : 'text-amber-accent'}`}>
-                {item.sender === 'AI' ? 'AI Host:' : 'You:'}
-              </span>
-              <p className="text-neutral-bg/80">{item.text}</p>
-            </div>
-          ))}
-          {transcript.length === 0 && (
-            <span className="text-xs text-neutral-bg/40 italic font-mono">Connecting and initializing audio session. AI will speak momentarily...</span>
-          )}
-        </div>
       </div>
 
       {/* Overlay Submission loader */}

@@ -28,7 +28,9 @@ export default function InterviewComplete({ onRestart }: InterviewCompleteProps)
             </div>
             <div className="text-xs">
               <span className="font-bold text-ink block mb-1 font-sans text-sm">What Happens Next</span>
-              <span className="text-ink/70 leading-relaxed font-sans">Your responses have been recorded and evaluated. Our talent team will review your results and reach out to you with feedback and next steps.</span>
+              <span className="text-ink/70 leading-relaxed font-sans">
+                Your responses have been recorded and evaluated. Our team will review your performance and will let you know of the next steps. Thank you for your time and have a great day!
+              </span>
             </div>
           </div>
         </div>

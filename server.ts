@@ -331,155 +331,199 @@ async function extractTextFromBuffer(buffer: Buffer, originalname: string, mimet
 }
 
 // Helper for uploading CV to Google Drive
-async function uploadCvToDrive(interviewId: string, fileBuffer: Buffer, fileName: string, mimeType: string): Promise<string> {
-  const serviceAccountKeyRaw = process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY;
-  const folderId = process.env.DRIVE_RECORDINGS_FOLDER_ID;
-
-  if (!serviceAccountKeyRaw) {
-    throw new Error("GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY environment variable is not defined");
-  }
-  if (!folderId) {
-    throw new Error("DRIVE_RECORDINGS_FOLDER_ID environment variable is not defined");
-  }
-
-  const credentials = JSON.parse(serviceAccountKeyRaw);
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ["https://www.googleapis.com/auth/drive"],
-  });
-
-  const drive = google.drive({ version: "v3", auth });
-
-  const fileMetadata = {
-    name: `cvs/${fileName}`,
-    parents: [folderId],
-  };
-
-  const media = {
-    mimeType: mimeType,
-    body: Readable.from(fileBuffer),
-  };
-
-  console.log(`[Server CV Upload] Uploading CV file to Google Drive Shared Folder ID: ${folderId}, filename: cvs/${fileName}`);
-  const createResponse = await drive.files.create({
-    supportsAllDrives: true,
-    requestBody: fileMetadata,
-    media: media,
-    fields: "id",
-  });
-
-  const fileId = createResponse.data.id;
-  if (!fileId) {
-    throw new Error("Failed to get file ID from Drive files.create response for CV");
-  }
-
-  console.log(`[Server CV Upload] Successfully uploaded CV to Drive. File ID: ${fileId}`);
-
-  // Set domain-level permissions (same as recordings)
-  console.log(`[Server CV Upload] Setting domain-level 'reader' permissions for workpodd.com on CV file: ${fileId}`);
-  await drive.permissions.create({
-    fileId: fileId,
-    supportsAllDrives: true,
-    requestBody: {
-      role: "reader",
-      type: "domain",
-      domain: "workpodd.com",
-    },
-  });
-
-  const cvFileUrl = `https://drive.google.com/file/d/${fileId}/preview`;
-  console.log(`[Server CV Upload] Generated CV Drive preview URL: ${cvFileUrl}`);
-  return cvFileUrl;
-}
-
-// POST /api/interviews - Create new interview with optional CV upload
-app.post("/api/interviews", upload.single("cv") as any, async (req, res) => {
-  console.log("[Server Create Interview] Received request body:", req.body);
-  const { applicantName, jobTitle, jobDescription, interviewType, duration } = req.body;
-
-  if (!applicantName || !jobTitle || !jobDescription || !interviewType || !duration) {
-    return res.status(400).json({ error: "Missing required fields" });
-  }
-
+async function uploadCvToDrive(interviewId: string, fileBuffer: Buffer, fileName: string, mimeType: string): Promise<string | null> {
   try {
-    // 1. Create document in Firestore first to get the interview ID
-    console.log("[Server Create Interview] Creating initial document in Firestore...");
-    const colRef = collection(db, "interviews");
-    const docRef = await addDoc(colRef, {
-      applicantName,
-      jobTitle,
-      jobDescription,
-      interviewType,
-      duration: parseInt(duration, 10),
-      status: "pending",
-      createdAt: new Date().toISOString(),
-      transcript: [],
-      cvText: null,
-      cvFileUrl: null,
-    });
+    const serviceAccountKeyRaw = process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY;
+    const folderId = process.env.DRIVE_RECORDINGS_FOLDER_ID;
 
-    const interviewId = docRef.id;
-    console.log(`[Server Create Interview] Created Firestore interview doc ID: ${interviewId}`);
-
-    let cvText: string | null = null;
-    let cvFileUrl: string | null = null;
-
-    // 2. Process file if uploaded
-    if (req.file) {
-      const file = req.file;
-      console.log(`[Server Create Interview] CV File uploaded: ${file.originalname} (${file.size} bytes)`);
-
-      // 2a. Text Extraction
-      try {
-        const extracted = await extractTextFromBuffer(file.buffer, file.originalname, file.mimetype);
-        if (extracted && extracted.trim()) {
-          cvText = extracted.trim();
-          console.log(`[Server Create Interview] Successfully extracted CV text. Length: ${cvText.length} chars.`);
-        } else {
-          console.warn(`[Server Create Interview] Text extraction returned empty/null for: ${file.originalname}`);
-        }
-      } catch (extractErr: any) {
-        console.error(`[Server Create Interview] Text extraction failed with raw error:`, extractErr);
-      }
-
-      // 2b. File Storage to Google Drive
-      try {
-        const fileExtension = path.extname(file.originalname).toLowerCase() || (file.mimetype === "application/pdf" ? ".pdf" : ".docx");
-        const driveFileName = `${interviewId}${fileExtension}`;
-        cvFileUrl = await uploadCvToDrive(interviewId, file.buffer, driveFileName, file.mimetype);
-        console.log(`[Server Create Interview] CV uploaded to Google Drive. URL: ${cvFileUrl}`);
-      } catch (driveErr: any) {
-        console.error(`[Server Create Interview] Google Drive upload failed with raw error:`, driveErr);
-      }
-
-      // 2c. Update Firestore with cvText and cvFileUrl
-      if (cvText !== null || cvFileUrl !== null) {
-        console.log(`[Server Create Interview] Updating Firestore interviews/${interviewId} with cvText/cvFileUrl...`);
-        await updateDoc(docRef, {
-          cvText,
-          cvFileUrl,
-        });
-        console.log(`[Server Create Interview] Firestore updated successfully with CV details.`);
-      }
-    } else {
-      console.log("[Server Create Interview] No CV file uploaded for this interview.");
+    if (!serviceAccountKeyRaw) {
+      console.warn("[Server CV Upload] GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY environment variable is not defined — skipping CV Drive upload");
+      return null;
+    }
+    if (!folderId) {
+      console.warn("[Server CV Upload] DRIVE_RECORDINGS_FOLDER_ID environment variable is not defined — skipping CV Drive upload");
+      return null;
     }
 
-    return res.json({
-      success: true,
-      interviewId,
-      cvTextLength: cvText ? cvText.length : 0,
-      cvFileUrl,
+    let credentials: any;
+    try {
+      credentials = JSON.parse(serviceAccountKeyRaw);
+    } catch (parseErr) {
+      console.error("[Server CV Upload] Failed to parse GOOGLE_DRIVE_SERVICE_ACCOUNT_KEY JSON:", parseErr);
+      return null;
+    }
+
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ["https://www.googleapis.com/auth/drive"],
     });
 
-  } catch (err: any) {
-    console.error("[Server Create Interview] CRITICAL ERROR during creation:", err);
-    return res.status(500).json({
-      error: `Failed to create interview: ${err.message || err}`,
-      details: err.stack || String(err),
+    const drive = google.drive({ version: "v3", auth });
+
+    const fileMetadata = {
+      name: `cvs/${fileName}`,
+      parents: [folderId],
+    };
+
+    const media = {
+      mimeType: mimeType,
+      body: Readable.from(fileBuffer),
+    };
+
+    console.log(`[Server CV Upload] Uploading CV file to Google Drive Shared Folder ID: ${folderId}, filename: cvs/${fileName}`);
+    const createResponse = await drive.files.create({
+      supportsAllDrives: true,
+      requestBody: fileMetadata,
+      media: media,
+      fields: "id",
     });
+
+    const fileId = createResponse.data.id;
+    if (!fileId) {
+      console.warn("[Server CV Upload] Failed to get file ID from Drive files.create response for CV");
+      return null;
+    }
+
+    console.log(`[Server CV Upload] Successfully uploaded CV to Drive. File ID: ${fileId}`);
+
+    // Set domain-level permissions (same as recordings)
+    try {
+      console.log(`[Server CV Upload] Setting domain-level 'reader' permissions for workpodd.com on CV file: ${fileId}`);
+      await drive.permissions.create({
+        fileId: fileId,
+        supportsAllDrives: true,
+        requestBody: {
+          role: "reader",
+          type: "domain",
+          domain: "workpodd.com",
+        },
+      });
+    } catch (permErr: any) {
+      console.warn(`[Server CV Upload] Non-fatal: failed to set domain permissions on CV ${fileId}:`, permErr?.message || permErr);
+    }
+
+    const cvFileUrl = `https://drive.google.com/file/d/${fileId}/preview`;
+    console.log(`[Server CV Upload] Generated CV Drive preview URL: ${cvFileUrl}`);
+    return cvFileUrl;
+  } catch (err: any) {
+    const status = err.status || err.statusCode || err.response?.status;
+    console.error(`[Server CV Upload] Google Drive API upload error (status=${status}):`, err?.message || err);
+    if (status === 403) {
+      console.warn(`[Server CV Upload] Google Drive API returned 403 PERMISSION_DENIED (API disabled or permissions missing). Handled safely without failing creation.`);
+    }
+    if (err?.response?.data) {
+      console.error(`[Server CV Upload] Google API Error Response Data:`, JSON.stringify(err.response.data));
+    }
+    return null;
   }
-});
+}
+
+// Helper for asynchronous background CV extraction, Drive upload, and Firestore updating
+async function processCvAndDriveInBackground(interviewId: string, file: Express.Multer.File): Promise<void> {
+  console.log(`[Background CV Processing] Starting for interview ${interviewId}: ${file.originalname} (${file.size} bytes)`);
+  let cvText: string | null = null;
+  let cvFileUrl: string | null = null;
+
+  // 1. Text Extraction
+  try {
+    const extracted = await extractTextFromBuffer(file.buffer, file.originalname, file.mimetype);
+    if (extracted && extracted.trim()) {
+      cvText = extracted.trim();
+      console.log(`[Background CV Processing] Successfully extracted CV text. Length: ${cvText.length} chars.`);
+    } else {
+      console.warn(`[Background CV Processing] Text extraction returned empty/null for: ${file.originalname}`);
+    }
+  } catch (extractErr: any) {
+    console.error(`[Background CV Processing] Text extraction failed with raw error:`, extractErr);
+  }
+
+  // 2. Google Drive upload
+  try {
+    const fileExtension = path.extname(file.originalname).toLowerCase() || (file.mimetype === "application/pdf" ? ".pdf" : ".docx");
+    const driveFileName = `${interviewId}${fileExtension}`;
+    cvFileUrl = await uploadCvToDrive(interviewId, file.buffer, driveFileName, file.mimetype);
+    if (cvFileUrl) {
+      console.log(`[Background CV Processing] CV uploaded to Google Drive. URL: ${cvFileUrl}`);
+    } else {
+      console.warn(`[Background CV Processing] Google Drive CV upload skipped or returned null.`);
+    }
+  } catch (driveErr: any) {
+    console.error(`[Background CV Processing] Google Drive upload error:`, driveErr);
+  }
+
+  // 3. Update Firestore with cvText and cvFileUrl
+  if (cvText !== null || cvFileUrl !== null) {
+    try {
+      console.log(`[Background CV Processing] Updating Firestore interviews/${interviewId} with cvText/cvFileUrl...`);
+      await updateDoc(doc(db, "interviews", interviewId), {
+        cvText,
+        cvFileUrl,
+      });
+      console.log(`[Background CV Processing] Firestore updated successfully for interview ${interviewId}.`);
+    } catch (updateErr: any) {
+      console.error(`[Background CV Processing] Failed to update Firestore with CV details:`, updateErr);
+    }
+  }
+}
+
+// POST /api/interviews - Create new interview with immediate response and background processing
+app.post(
+  "/api/interviews",
+  (req, res, next) => {
+    (upload.single("cv") as any)(req, res, (err: any) => {
+      if (err) {
+        console.error("[Server Create Interview] Multer upload error:", err);
+        return res.status(400).type("json").json({ error: err.message || "File upload error" });
+      }
+      next();
+    });
+  },
+  async (req, res) => {
+    res.type("json");
+    try {
+      console.log("[Server Create Interview] Received request body:", req.body);
+      const { applicantName, jobTitle, jobDescription, interviewType, duration } = req.body;
+
+      if (!applicantName || !jobTitle || !jobDescription || !interviewType || !duration) {
+        return res.status(400).type("json").json({ error: "Missing required fields" });
+      }
+
+      // 1. Create document in Firestore
+      console.log("[Server Create Interview] Creating initial document in Firestore...");
+      const colRef = collection(db, "interviews");
+      const docRef = await addDoc(colRef, {
+        applicantName,
+        jobTitle,
+        jobDescription,
+        interviewType,
+        duration: parseInt(duration, 10),
+        status: "pending",
+        createdAt: new Date().toISOString(),
+        transcript: [],
+        cvText: null,
+        cvFileUrl: null,
+      });
+
+      const interviewId = docRef.id;
+      console.log(`[Server Create Interview] Created Firestore interview doc ID: ${interviewId}`);
+
+      // 2. Send immediate response to client
+      res.status(200).type("json").json({ success: true, interviewId });
+
+      // 3. Process CV / Drive uploads asynchronously in the background without blocking the HTTP response
+      if (req.file) {
+        processCvAndDriveInBackground(interviewId, req.file).catch((err) => {
+          console.error("[Background Processing Error]", err);
+        });
+      } else {
+        console.log("[Server Create Interview] No CV file uploaded for this interview.");
+      }
+    } catch (err: any) {
+      console.error("[Server Create Interview] Unexpected error creating interview:", err);
+      return res.status(500).type("json").json({ error: err.message || "Failed to create interview" });
+    }
+  }
+);
 
 // DELETE /api/interviews/:id
 app.delete("/api/interviews/:id", async (req, res) => {
@@ -894,9 +938,28 @@ async function finalizeVideo(interviewId: string): Promise<string> {
       return recordingUrl;
 
     } catch (driveErr: any) {
-      console.error(`[Server Finalize] CRITICAL ERROR uploading to Google Drive:`, driveErr);
+      console.error(`[Server Finalize] Error uploading recording to Google Drive:`, driveErr);
       if (driveErr.response) {
         console.error(`[Server Finalize] Google API Error Response Data:`, JSON.stringify(driveErr.response.data || driveErr.response));
+      }
+
+      const status = driveErr.status || driveErr.statusCode || driveErr.response?.status;
+      if (status === 403) {
+        console.warn(`[Server Finalize] Google Drive API returned 403 PERMISSION_DENIED (API disabled or permissions missing). Handled safely.`);
+      }
+
+      // Clean up local files (both original webm and converted mp4)
+      try {
+        if (fs.existsSync(localFilePath)) {
+          fs.unlinkSync(localFilePath);
+          console.log(`[Server Finalize] Cleaned up local WebM file: ${localFilePath}`);
+        }
+        if (isTranscoded && fs.existsSync(localMp4Path)) {
+          fs.unlinkSync(localMp4Path);
+          console.log(`[Server Finalize] Cleaned up local transcoded MP4 file: ${localMp4Path}`);
+        }
+      } catch (cleanupErr) {
+        console.warn(`[Server Finalize] Failed to clean up local files:`, cleanupErr);
       }
 
       // Update Firestore to let the admin know the recording failed
@@ -910,7 +973,8 @@ async function finalizeVideo(interviewId: string): Promise<string> {
         console.error(`[Server Finalize] Failed to set status to failed in Firestore:`, dbErr);
       }
 
-      throw driveErr;
+      // Return empty string safely instead of crashing or throwing
+      return "";
     }
   } finally {
     reassemblingInterviews.delete(interviewId);
@@ -919,19 +983,22 @@ async function finalizeVideo(interviewId: string): Promise<string> {
 
 // Server-side Finalize Video Endpoint
 app.post("/api/finalize-video", express.json(), async (req, res) => {
+  res.type("json");
   const { interviewId } = req.body;
   if (!interviewId) {
-    return res.status(400).json({ error: "interviewId is required" });
+    return res.status(400).type("json").json({ error: "interviewId is required" });
   }
 
   console.log(`[Server Finalize] Finalize request received for interview ${interviewId}`);
   try {
     const url = await finalizeVideo(interviewId);
-    return res.json({ success: true, url });
+    return res.status(200).type("json").json({ success: true, url: url || null });
   } catch (err: any) {
-    return res.status(500).json({
-      error: `Failed to finalize video: ${err.message || err}`,
-      details: err.stack || String(err)
+    console.error(`[Server Finalize] Finalize video error handled safely:`, err);
+    return res.status(200).type("json").json({
+      success: true,
+      url: null,
+      warning: `Video finalization completed with upload error: ${err.message || err}`,
     });
   }
 });
@@ -1161,6 +1228,25 @@ wss.on("connection", (ws, request) => {
     console.error(`[Proxy Server] [Session ${sessionId}] Frontend Client WS error:`, error);
     safeClose(geminiWs, 1011, "Frontend Client connection error");
   });
+});
+
+// Explicit 404 handler for unmatched /api routes so they NEVER fall through to HTML / Vite SPA fallback
+app.all("/api/*", (req, res) => {
+  res.status(404).type("json").json({
+    error: `API route not found: ${req.method} ${req.originalUrl}`,
+  });
+});
+
+// Explicit API error handling middleware to guarantee JSON response on errors
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (req.path.startsWith("/api") || req.originalUrl.startsWith("/api")) {
+    console.error("[API Error Handler]", err);
+    return res.status(err.status || 500).type("json").json({
+      error: err.message || "Internal Server Error",
+      details: process.env.NODE_ENV !== "production" ? err.stack : undefined,
+    });
+  }
+  next(err);
 });
 
 // Mount Vite middleware / Static handlers
